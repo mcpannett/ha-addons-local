@@ -1,0 +1,381 @@
+/**
+ * Composition root for one gateway process.
+ *
+ * This module creates configuration, snapshot storage, normalized state, the
+ * real or simulated provider, stream management, and the authenticated HTTP
+ * server in dependency order. It also attaches provider callbacks and owns
+ * process shutdown. It is intentionally not a home for business rules: if a
+ * change needs to parse Eufy data, alter state policy, or change an endpoint,
+ * it belongs in the neighbouring boundary module instead.
+ */
+import { rawBuildFingerprint } from "./diagnostics/raw-provenance.js";
+import { installRawRtcCapture } from "./diagnostics/raw-rtc.js";
+import { RawHistory, setRawHistory } from "./diagnostics/raw-history.js";
+import { join } from "node:path";
+import { EventImageCapture } from "./diagnostics/event-image-capture.js";
+
+import { loadConfig } from "./config.js";
+import { GatewayState } from "./domain/gateway-state.js";
+import { createLogger, getLogIdentity } from "./logging.js";
+import { EufyProvider } from "./provider/eufy-provider.js";
+import type { CameraProvider, ProviderEvents } from "./provider/provider.js";
+import type { CaptchaProvider } from "./provider/provider.js";
+import { SimulatedProvider } from "./provider/simulated-provider.js";
+import { GatewayServer } from "./server.js";
+import { StartupSnapshotWarmup, supportsStartupSnapshot } from "./startup-snapshot-warmup.js";
+import { SnapshotStore } from "./storage/snapshot-store.js";
+import {
+  LiveStreamManager,
+  spawnH265ViewerTranscoder,
+  type ViewerClientSummary,
+  type ViewerStartupSummary,
+  type ViewerDeliverySummary,
+  type ViewerTranscoderSummary,
+} from "./stream/live-stream-manager.js";
+import type { LivePacingSummary } from "./stream/live-frame-pacer.js";
+import type { LiveAudioStartupSummary } from "./stream/live-transport-muxer.js";
+import type { NativeTransportSummary } from "./stream/live-native-transport.js";
+
+const logger = createLogger("gateway");
+const providerLogger = createLogger("provider");
+const processLogger = createLogger("process");
+const logIdentity = getLogIdentity();
+
+function fatal(event: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : "Unknown process failure";
+  processLogger.error(event, `Eufy gateway is stopping after an unexpected process failure: ${message}`, error);
+  process.exit(1);
+}
+
+process.once("uncaughtException", (error) => fatal("uncaught_exception", error));
+process.once("unhandledRejection", (error) => fatal("unhandled_rejection", error));
+logger.info("gateway_start", `Eufy Mega Security starting with Node.js ${process.version}`);
+
+const config = loadConfig();
+let rawHistory: RawHistory | undefined;
+let stopRawRtc: () => void = () => undefined;
+if (["1", "true"].includes(process.env.EUFY_RAW_HISTORY ?? "")) {
+  try {
+    rawHistory = new RawHistory({ directory: join(config.dataDirectory, "private-raw-history"), buildFingerprint: await rawBuildFingerprint() });
+    await rawHistory.initialize();
+    setRawHistory(rawHistory);
+    stopRawRtc = installRawRtcCapture();
+    logger.info("raw_history_enabled", "Private encrypted raw history is active, limited to 24 hours and 1 GiB. Raw files are excluded from diagnostic bundles.");
+  } catch {
+    rawHistory = undefined;
+    setRawHistory(undefined, true);
+    logger.error("raw_history_unavailable", "Private raw history could not start. Check its storage and key permissions. Device connections will continue without raw recording.");
+  }
+}
+if (config.experimentalEventImageRequest) {
+  logger.info("event_image_trial_retired", "The retired event-picture test is ignored. Pictures use authenticated requests.");
+}
+const eventImageCapture = config.captureFailedEventImages ? new EventImageCapture() : null;
+if (eventImageCapture) {
+  logger.warn("event_image_capture_enabled", "Private failed event-image capture is on for 30 minutes, with export for 60 minutes. Restarting reopens capture while the option remains enabled.");
+}
+const state = new GatewayState();
+const snapshots = new SnapshotStore(config.dataDirectory);
+await snapshots.initialize();
+
+let simulatedProvider: SimulatedProvider | null = null;
+let provider: CameraProvider;
+let captchaProvider: CaptchaProvider | null = null;
+if (config.provider === "simulated") {
+  simulatedProvider = new SimulatedProvider();
+  provider = simulatedProvider;
+} else {
+  if (!config.eufy.username || !config.eufy.password) {
+    throw new Error("EUFY_USERNAME and EUFY_PASSWORD are required when EUFY_GATEWAY_PROVIDER=eufy");
+  }
+  const eufyProvider = new EufyProvider({
+    username: config.eufy.username,
+    password: config.eufy.password,
+    country: config.eufy.country,
+    persistentDirectory: join(config.dataDirectory, "eufy-client"),
+    maxStreamSeconds: config.maxStreamSeconds,
+    experimentalModelControls: config.experimentalModelControls,
+    experimentalE30Locks: config.experimentalE30Locks,
+    experimentalNvrLive: config.experimentalNvrLive,
+    experimentalT8420Live: config.experimentalT8420Live,
+    experimentalNvrModeObserver: config.experimentalNvrModeObserver,
+    experimentalNvrControls: config.experimentalNvrControls,
+    normalNvrLive: config.experimentalNvrLive,
+    apiAuthenticationConfigured: !!config.apiToken,
+    experimentalDoorbellRtc: config.experimentalDoorbellRtc,
+    experimentalGeneralRtc: config.experimentalGeneralRtc,
+    experimentalCloudRecordings: config.experimentalCloudRecordings,
+    experimentalEventImageRequest: config.experimentalEventImageRequest,
+    experimentalHomeBaseEventImages: config.experimentalHomeBaseEventImages,
+    experimentalHomeBaseEventNames: config.experimentalHomeBaseEventNames,
+    experimentalNvrRegion: config.experimentalNvrRegion,
+    ...(eventImageCapture ? { eventImageCapture } : {}),
+    ...(config.eufy.verifyCode ? { verifyCode: config.eufy.verifyCode } : {}),
+  });
+  provider = eufyProvider;
+  captchaProvider = eufyProvider;
+}
+
+const streams = new LiveStreamManager(
+  state,
+  snapshots,
+  provider,
+  config.streamGraceMilliseconds,
+  undefined,
+  () => spawnH265ViewerTranscoder(config.experimentalFixedH265Resolution, config.experimentalLowCpuH265Conversion),
+  undefined,
+  undefined,
+  undefined,
+  config.experimentalS340SmoothLive,
+);
+streams.on("native-transport-closed", (summary: NativeTransportSummary & { model: string }) => {
+  const model = /^T[0-9A-Z]{3,15}$/.test(summary.model) ? summary.model : "unknown";
+  logger.info("camera_native_transport", `model=${model} codec=${summary.codec ?? "unknown"} audio=${summary.audio} start_wait_ms=${summary.startWaitMilliseconds ?? "none"} video_units=${summary.videoUnits} audio_batches=${summary.audioBatches} audio_resyncs=${summary.audioResyncs} audio_dropped=${summary.audioDropped}`);
+});
+streams.on("live-pacing-closed", (summary: LivePacingSummary) => {
+  logger.info("camera_live_pacing", `model=T8171 buffer_ms=${summary.bufferMilliseconds} late_packets=${summary.latePackets} peak_queued_bytes=${summary.maximumQueuedBytes} video_packets=${summary.videoPackets} audio_packets=${summary.audioPackets} clock_rebases=${summary.clockRebases}`);
+});
+streams.on("live-audio-startup-closed", (summary: LiveAudioStartupSummary & { model: string }) => {
+  const model = /^T[0-9A-Z]{3,15}$/.test(summary.model) ? summary.model : "unknown";
+  logger.info("camera_live_audio_startup", `model=${model} wait_ms=${summary.waitMilliseconds} first_audio_after_video_ms=${summary.firstAudioAfterVideoMilliseconds ?? "not-observed"} audio_selected=${summary.audioSelected ?? "not-started"}`);
+});
+provider.setNvrLiveMediaChecks?.({ viewer: serial => streams.hasActiveViewer(serial), active: serial => streams.hasActiveSession(serial), recording: serial => streams.hasActiveRecording(serial), yieldable: serial => streams.canYieldSource(serial), settling: serial => streams.isSourceSettling(serial), retiring: serial => streams.isSourceRetiring(serial), retireYieldable: (serial, onlyIfUnused) => streams.retireYieldableSource(serial, onlyIfUnused) });
+streams.on("ffmpeg-error", (detail: string) => {
+  logger.warn("ffmpeg_error", `Camera media conversion reported an error: ${detail}`);
+});
+streams.on("warning", (error: unknown) => {
+  const detail = error instanceof Error ? error.message : "Unknown media pipeline warning";
+  logger.warn("media_pipeline_warning", `Camera media pipeline reported a recoverable warning: ${detail}`);
+});
+streams.on("shared-lens-closed", (detail: { model: string; reason: string }) => {
+  logger.info("shared_lens_view_closed", `model=${detail.model} reason=${detail.reason}`);
+});
+streams.on("viewer-transcoder-stopped", (detail: ViewerTranscoderSummary) => {
+  const input = detail.inputCadence;
+  const output = detail.outputCadence;
+  logger.info(
+    "viewer_transcoder_stopped",
+    [
+      "H.265 viewer conversion stopped:",
+      `input_bytes=${detail.inputBytes}`,
+      `output_bytes=${detail.outputBytes}`,
+      `output_chunks=${detail.outputChunks}`,
+      `bootstrap_ready=${detail.bootstrapReady}`,
+      `silent_restarts=${detail.silentRestarts}`,
+      `input_samples=${input.samples}`,
+      `input_duration_ms=${input.durationMilliseconds}`,
+      `input_max_gap_ms=${input.maximumGapMilliseconds}`,
+      `input_gaps_500ms=${input.gapsAtLeast500Milliseconds}`,
+      `input_gaps_1000ms=${input.gapsAtLeast1000Milliseconds}`,
+      `input_gaps_2000ms=${input.gapsAtLeast2000Milliseconds}`,
+      `output_samples=${output.samples}`,
+      `output_duration_ms=${output.durationMilliseconds}`,
+      `output_max_gap_ms=${output.maximumGapMilliseconds}`,
+      `output_gaps_500ms=${output.gapsAtLeast500Milliseconds}`,
+      `output_gaps_1000ms=${output.gapsAtLeast1000Milliseconds}`,
+      `output_gaps_2000ms=${output.gapsAtLeast2000Milliseconds}`,
+      `client_backpressure_events=${detail.clientBackpressureEvents}`,
+      `client_max_writable_bytes=${detail.maximumClientWritableBytes}`,
+      `input_skips=${detail.inputSkips}`,
+      `input_skipped_bytes=${detail.inputSkippedBytes}`,
+      `input_max_age_ms=${Math.round(detail.maximumInputAgeMilliseconds)}`,
+    ].join(" "),
+  );
+});
+streams.on("viewer-delivery-stopped", (detail: ViewerDeliverySummary) => {
+  const source = detail.sourceCadence;
+  const viewer = detail.viewerCadence;
+  logger.info(
+    "viewer_delivery_stopped",
+    [
+      `Viewer delivery stopped: model=${detail.model}`,
+      `codec=${detail.sourceCodec ?? "unknown"}`,
+      `source_bytes=${detail.sourceBytes}`,
+      `source_chunks=${detail.sourceChunks}`,
+      `random_access_pictures=${detail.randomAccessPictures}`,
+      `keyframe_continuation_nals=${detail.keyframeContinuationNals}`,
+      `startup_group_overflows=${detail.startupGroupOverflows}`,
+      `source_duration_ms=${source.durationMilliseconds}`,
+      `source_max_gap_ms=${source.maximumGapMilliseconds}`,
+      `source_gaps_2000ms=${source.gapsAtLeast2000Milliseconds}`,
+      `viewer_bytes=${detail.viewerBytes}`,
+      `viewer_chunks=${detail.viewerChunks}`,
+      `viewer_duration_ms=${viewer.durationMilliseconds}`,
+      `viewer_max_gap_ms=${viewer.maximumGapMilliseconds}`,
+      `viewer_gaps_2000ms=${viewer.gapsAtLeast2000Milliseconds}`,
+      `client_starts=${detail.clientStarts}`,
+      `client_writes=${detail.clientWrites}`,
+      `client_backpressure_events=${detail.clientBackpressureEvents}`,
+      `client_max_writable_bytes=${detail.maximumClientWritableBytes}`,
+      `snapshot_input_skips=${detail.snapshotInputSkips}`,
+      `snapshot_input_max_age_ms=${Math.round(detail.maximumSnapshotInputAgeMilliseconds)}`,
+    ].join(" "),
+  );
+});
+streams.on("viewer-startup-timings", (detail: ViewerStartupSummary) => {
+  logger.info("camera_viewer_start_timings", [
+    `model=${detail.model} profile=${detail.profile} codec=${detail.sourceCodec ?? "unknown"}`,
+    `source_attempt=${detail.sourceAttempt} conversion_attempt=${detail.conversionAttempt} outcome=${detail.outcome}`,
+    `source_first_byte_ms=${detail.sourceFirstByteMilliseconds ?? "none"}`,
+    `source_random_access_ms=${detail.sourceRandomAccessMilliseconds ?? "none"}`,
+    `conversion_start_ms=${detail.conversionStartMilliseconds ?? "none"}`,
+    `conversion_first_output_ms=${detail.conversionFirstOutputMilliseconds ?? "none"}`,
+    `viewer_random_access_ms=${detail.viewerRandomAccessMilliseconds ?? "none"}`,
+    `first_write_ms=${detail.firstWriteMilliseconds ?? "none"} ready_write_ms=${detail.readyWriteMilliseconds ?? "none"}`,
+    `warm_source=${detail.warmSource} warm_viewer=${detail.warmViewer}`,
+  ].join(" "));
+});
+streams.on("viewer-client-stopped", (detail: ViewerClientSummary) => {
+  logger.info(
+    "viewer_client_stopped",
+    [
+      `Viewer client stopped: model=${detail.model}`,
+      `codec=${detail.sourceCodec ?? "unknown"}`,
+      `profile=${detail.profile}`,
+      `source_active=${detail.sourceActive}`,
+      `source_attached=${detail.sourceAttached}`,
+      `closed_by=${detail.closeReason}`,
+      `delivery_started=${detail.deliveryStarted}`,
+      `duration_ms=${detail.durationMilliseconds}`,
+      `first_byte_delay_ms=${detail.firstByteDelayMilliseconds ?? "none"}`,
+      `last_byte_age_ms=${detail.lastByteAgeMilliseconds ?? "none"}`,
+      `delivered_bytes=${detail.deliveredBytes}`,
+      `delivered_chunks=${detail.deliveredChunks}`,
+      `backpressure_events=${detail.backpressureEvents}`,
+      `maximum_writable_bytes=${detail.maximumWritableBytes}`,
+      `source_bytes=${detail.sourceBytes}`,
+      `source_chunks=${detail.sourceChunks}`,
+    ].join(" "),
+  );
+});
+const startupSnapshots = new StartupSnapshotWarmup(
+  (serial) => state.hasCamera(serial) && state.getCamera(serial).snapshot !== null,
+  (serial) => streams.captureStartupSnapshot(serial),
+  (error) => {
+    const message = error instanceof Error ? error.message : "Snapshot capture failed";
+    logger.warn("initial_snapshot_unavailable", `Initial camera snapshot unavailable: ${message}`);
+  },
+);
+
+// Provider callbacks are the only bridge from Eufy-specific code into the
+// gateway state. This keeps the HTTP server and Home Assistant API unaware of
+// Mega packet formats and authentication details.
+const providerEvents: ProviderEvents = {
+  locks(locks) { state.replaceLocks(locks); },
+  camera(identity) {
+    state.registerCamera(identity);
+    const stored = snapshots.getInfo(identity.serial);
+    if (stored) state.restoreSnapshot(identity.serial, stored);
+    else if (supportsStartupSnapshot(identity)) startupSnapshots.enqueue(identity.serial);
+    const storedEventImage = snapshots.getEventInfo(identity.serial);
+    if (storedEventImage) state.restoreEventImage(identity.serial, storedEventImage);
+  },
+  station(station) {
+    state.registerStation(station);
+  },
+  sensor(sensor) {
+    state.registerSensor(sensor);
+  },
+  connection(connectionState, detail) {
+    state.updateConnection(connectionState, detail);
+    if (connectionState === "connected") startupSnapshots.start();
+    const suffix = detail ? `: ${detail}` : "";
+    if (connectionState === "error") providerLogger.error("connection_error", `Eufy connection ${connectionState}${suffix}`);
+    else providerLogger.info(`connection_${connectionState.replace("-", "_")}`, `Eufy connection ${connectionState}${suffix}`);
+  },
+  motion(serial, detected) {
+    if (state.hasCamera(serial)) state.recordMotion(serial, detected);
+  },
+  person(serial, detected, personName, eventIdentity) {
+    if (state.hasCamera(serial)) state.recordPerson(serial, detected, personName, new Date(), eventIdentity);
+  },
+  personName(serial, eventIdentity, personName) {
+    if (state.hasCamera(serial)) state.enrichPersonName(serial, eventIdentity, personName);
+  },
+  detection(serial, kind, detected) {
+    if (state.hasCamera(serial)) state.recordDetection(serial, kind, detected);
+  },
+  doorbell(serial, pressed, personName, eventIdentity) {
+    if (state.hasCamera(serial)) state.recordDoorbell(serial, pressed, new Date(), personName ?? null, eventIdentity ?? null);
+  },
+  doorbellName(serial, eventIdentity, personName) {
+    if (state.hasCamera(serial)) state.enrichDoorbellName(serial, eventIdentity, personName);
+  },
+  sensorContact(serial, open) {
+    state.updateSensorContact(serial, open);
+  },
+  sensorMotion(serial, detected) {
+    state.recordSensorMotion(serial, detected);
+  },
+  sensorDetection(serial, kind, detected) {
+    state.recordSensorDetection(serial, kind, detected);
+  },
+  snapshot(serial, data, contentType) {
+    if (!state.hasCamera(serial)) return;
+    void snapshots.writeEvent(serial, data, contentType).then(({ eventImage, snapshot }) => {
+      state.updateEventImage(serial, eventImage);
+      if (snapshot) {
+        state.updateSnapshot(serial, snapshot);
+        providerLogger.info("push_snapshot_updated", "Eufy push snapshot retained");
+      } else {
+        providerLogger.info("push_snapshot_preserved_live", "Eufy push snapshot did not replace the retained live frame");
+      }
+    });
+  },
+  pushDiagnostic(diagnostic) {
+    state.recordPushDiagnostic(diagnostic);
+  },
+  eventReceiverState(receiverState) {
+    state.recordEventReceiverState(receiverState);
+  },
+  eventDelivery(outcome) {
+    state.recordEventDelivery(outcome);
+  },
+  inventory(diagnostics) {
+    state.updateInventoryDiagnostics(diagnostics);
+  },
+  cameraCapabilities(manifests) {
+    state.updateCameraCapabilities(manifests);
+  },
+  deviceCapabilities(manifests) {
+    state.updateDeviceCapabilities(manifests);
+  },
+  streamStarted(serial, video, codecHint, audio) {
+    if (state.hasCamera(serial)) streams.attachSource(serial, video, codecHint, audio);
+  },
+  streamStopped(serial) {
+    if (state.hasCamera(serial)) streams.markStopped(serial);
+  },
+};
+
+const server = new GatewayServer(config, state, snapshots, streams, provider, simulatedProvider, captchaProvider, eventImageCapture);
+await server.listen();
+logger.info(
+  "gateway_listening",
+  `Eufy gateway ${logIdentity.version} listening on http://${config.host}:${config.port} (${config.provider} provider)`,
+);
+
+void provider.start(providerEvents).catch((error: unknown) => {
+  const message = error instanceof Error ? error.message : "Provider failed to start";
+  state.updateConnection("error", message);
+  providerLogger.error("provider_start_failed", `Eufy provider failed: ${message}`);
+});
+
+let shuttingDown = false;
+async function shutdown(reason: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info("gateway_stop", `Eufy gateway stopping: ${reason}`);
+  startupSnapshots.stop();
+  state.close();
+  eventImageCapture?.close();
+  await server.close();
+  await streams.close();
+  await provider.close();
+  stopRawRtc();
+  await rawHistory?.close();
+  setRawHistory(undefined);
+}
+
+process.on("SIGINT", () => void shutdown("sigint").finally(() => process.exit(0)));
+process.on("SIGTERM", () => void shutdown("supervisor_sigterm").finally(() => process.exit(0)));

@@ -1,0 +1,2178 @@
+/**
+ * Owns the gateway's camera-media lifecycle above a provider byte stream.
+ *
+ * A camera source opens only for the first viewer or capture request. This
+ * manager shares that source, fans Annex-B video to HTTP viewers, feeds
+ * FFmpeg for a JPEG frame, live MPEG-TS or bounded MP4, retains the resulting snapshot, cancels idle
+ * sources after a grace period, and enforces the maximum stream lifetime. It
+ * knows media lifecycle and process management, but not Mega login or PPCS
+ * packet construction.
+ * Pending startup belongs to the session and is shared by all its consumers.
+ */
+import { spawn, type ChildProcessWithoutNullStreams, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import type { ServerResponse } from "node:http";
+import { setPriority } from "node:os";
+import { type Readable, type Writable } from "node:stream";
+
+import type { DiagnosticMedia } from "../diagnostics/bundle-capture.js";
+
+import { GatewayState } from "../domain/gateway-state.js";
+import type { CameraState, GatewayEvent, SnapshotInfo, VideoCodec } from "../domain/types.js";
+import { SnapshotStore } from "../storage/snapshot-store.js";
+import { ViewerStartupTimeline, type ViewerStartupMilestones } from "./viewer-startup-timeline.js";
+import { SharedLensViews, spawnSharedLensConverter, type SharedLens, type SharedLensConverterFactory } from "./shared-lens-views.js";
+import { JpegParser } from "./jpeg-parser.js";
+import { qualifiedS340LiveSource } from "./live-frame-clock.js";
+import { MediaInputBound } from "./media-input-bound.js";
+import { LiveTransportMuxer, type VideoViewerResponse } from "./live-transport-muxer.js";
+import { NativeTransportMuxer } from "./live-native-transport.js";
+
+/** Provider operations needed to open and close a camera source. */
+export interface StreamController {
+
+  /**
+   * Retain ownership of provider I/O, including cleanup if startup rejects.
+   * With takeOver, an NVR may move its one call here from a camera that can yield.
+   */
+  startStream(serial: string, takeOver?: boolean): Promise<void>;
+
+  /** Resolve after the old source's stop callbacks and owned media I/O have retired. */
+  stopStream(serial: string): Promise<void>;
+}
+
+/** Bounded timing counters for one side of a viewer conversion session. */
+export interface StreamCadenceSummary {
+  readonly samples: number;
+  readonly durationMilliseconds: number;
+  readonly maximumGapMilliseconds: number;
+  readonly gapsAtLeast500Milliseconds: number;
+  readonly gapsAtLeast1000Milliseconds: number;
+  readonly gapsAtLeast2000Milliseconds: number;
+}
+
+/**
+ * Tracks chunk timing without retaining media or wall-clock timestamps.
+ *
+ * One tracker belongs to one viewer transcoder invocation and is discarded
+ * with that invocation. Its summary crosses only the privacy-safe logging
+ * boundary used to compare camera input with converted viewer output.
+ */
+export class StreamCadenceTracker {
+  #firstAtMilliseconds: number | null = null;
+  #lastAtMilliseconds: number | null = null;
+  #samples = 0;
+  #maximumGapMilliseconds = 0;
+  #gapsAtLeast500Milliseconds = 0;
+  #gapsAtLeast1000Milliseconds = 0;
+  #gapsAtLeast2000Milliseconds = 0;
+
+  /** Record one chunk arrival using a monotonic timestamp supplied by the caller or runtime. */
+  record(atMilliseconds = performance.now()): void {
+    if (!Number.isFinite(atMilliseconds)) return;
+    if (this.#firstAtMilliseconds === null) this.#firstAtMilliseconds = atMilliseconds;
+    if (this.#lastAtMilliseconds !== null) {
+      const gapMilliseconds = Math.max(0, atMilliseconds - this.#lastAtMilliseconds);
+      this.#maximumGapMilliseconds = Math.max(this.#maximumGapMilliseconds, gapMilliseconds);
+      if (gapMilliseconds >= 500) this.#gapsAtLeast500Milliseconds += 1;
+      if (gapMilliseconds >= 1_000) this.#gapsAtLeast1000Milliseconds += 1;
+      if (gapMilliseconds >= 2_000) this.#gapsAtLeast2000Milliseconds += 1;
+    }
+    this.#lastAtMilliseconds = atMilliseconds;
+    this.#samples += 1;
+  }
+
+  /** Return integer millisecond counters suitable for one bounded log line. */
+  get summary(): StreamCadenceSummary {
+    const durationMilliseconds = this.#firstAtMilliseconds === null || this.#lastAtMilliseconds === null
+      ? 0
+      : this.#lastAtMilliseconds - this.#firstAtMilliseconds;
+    return {
+      samples: this.#samples,
+      durationMilliseconds: Math.round(durationMilliseconds),
+      maximumGapMilliseconds: Math.round(this.#maximumGapMilliseconds),
+      gapsAtLeast500Milliseconds: this.#gapsAtLeast500Milliseconds,
+      gapsAtLeast1000Milliseconds: this.#gapsAtLeast1000Milliseconds,
+      gapsAtLeast2000Milliseconds: this.#gapsAtLeast2000Milliseconds,
+    };
+  }
+}
+
+/** Privacy-safe outcome for one H.265-to-H.264 viewer conversion. */
+export interface ViewerTranscoderSummary {
+  readonly inputBytes: number;
+  readonly outputBytes: number;
+  readonly outputChunks: number;
+  readonly bootstrapReady: boolean;
+
+  /** Bounded recoveries from missing initial output or a later conversion stall. */
+  readonly silentRestarts: number;
+  readonly inputCadence: StreamCadenceSummary;
+  readonly outputCadence: StreamCadenceSummary;
+  readonly clientBackpressureEvents: number;
+  readonly maximumClientWritableBytes: number;
+
+  /** Times the conversion fell too far behind and skipped to the next keyframe, and the input it never received. */
+  readonly inputSkips: number;
+  readonly inputSkippedBytes: number;
+  readonly maximumInputAgeMilliseconds: number;
+}
+
+/** Codec-independent delivery evidence from camera source through HTTP viewers. */
+export interface ViewerDeliverySummary {
+  readonly model: string;
+  readonly sourceCodec: VideoCodec | null;
+  readonly sourceBytes: number;
+  readonly sourceChunks: number;
+  readonly sourceCadence: StreamCadenceSummary;
+  readonly randomAccessPictures: number;
+  readonly keyframeContinuationNals: number;
+  readonly startupGroupOverflows: number;
+  readonly viewerBytes: number;
+  readonly viewerChunks: number;
+  readonly viewerCadence: StreamCadenceSummary;
+  readonly clientStarts: number;
+  readonly clientWrites: number;
+  readonly clientBackpressureEvents: number;
+  readonly maximumClientWritableBytes: number;
+
+  /** The same skip evidence for the snapshot extractor. */
+  readonly snapshotInputSkips: number;
+  readonly maximumSnapshotInputAgeMilliseconds: number;
+}
+
+/** Selects existing H.264 compatibility conversion or unchanged source video for one viewer. */
+export type ViewerProfile = "compatible" | "native";
+
+/**
+ * First observed termination owner, without an error message or private identity.
+ * Consumer closure includes HTTP transport closure and does not prove user intent.
+ */
+export type ViewerCloseReason = "consumer_closed" | "consumer_error" | "start_failed" | "provider_stopped"
+  | "source_ended" | "source_error" | "gateway_closed" | "codec_changed" | "conversion_failed" | "backpressure";
+
+/** Privacy-safe delivery evidence captured when one HTTP viewer disconnects. */
+export interface ViewerClientSummary {
+
+  /** First observed closure cause, preserved through later error and close events. */
+  readonly closeReason: ViewerCloseReason;
+
+  /** Whether this viewer ever had a provider source attached, even if it sent no bytes. */
+  readonly sourceAttached: boolean;
+  readonly profile: ViewerProfile;
+  readonly model: string;
+  readonly sourceCodec: VideoCodec | null;
+  readonly sourceActive: boolean;
+  readonly deliveryStarted: boolean;
+  readonly durationMilliseconds: number;
+  readonly firstByteDelayMilliseconds: number | null;
+  readonly lastByteAgeMilliseconds: number | null;
+  readonly deliveredBytes: number;
+  readonly deliveredChunks: number;
+  readonly backpressureEvents: number;
+  readonly maximumWritableBytes: number;
+  readonly sourceBytes: number;
+  readonly sourceChunks: number;
+}
+
+/** HTTP-write milestones for one viewer/source attempt. They do not prove HA rendering. */
+export interface ViewerStartupSummary extends ViewerStartupMilestones {
+  readonly model: string;
+  readonly profile: ViewerProfile;
+  readonly sourceCodec: VideoCodec | null;
+  readonly sourceAttempt: number;
+  readonly outcome: "random_access_queued" | "closed_before_random_access";
+  readonly firstWriteMilliseconds: number | null;
+  readonly readyWriteMilliseconds: number | null;
+}
+
+interface ViewerClientDelivery {
+  closeReason: ViewerCloseReason | null;
+  sourceAttached: boolean;
+  readonly profile: ViewerProfile;
+  startedCodec: VideoCodec | null;
+  readonly requestedAtMilliseconds: number;
+  startupReported: boolean;
+  attemptFirstWriteAtMilliseconds: number | null;
+  randomAccessQueuedAtMilliseconds: number | null;
+  deliveryStarted: boolean;
+  firstWriteAtMilliseconds: number | null;
+  lastWriteAtMilliseconds: number | null;
+  deliveredBytes: number;
+  deliveredChunks: number;
+  backpressureEvents: number;
+  maximumWritableBytes: number;
+}
+
+/** One provider start shared by consumers until it settles or its session retires. */
+interface PendingSourceStart {
+  readonly promise: Promise<void>;
+
+  /** Reject waiters only. The provider's stop operation owns cancellation of I/O. */
+  readonly reject: (error: unknown) => void;
+}
+
+interface Session {
+  readonly clients: Set<VideoViewerResponse>;
+  readonly pendingClients: Set<VideoViewerResponse>;
+  readonly clientDeliveries: Map<VideoViewerResponse, ViewerClientDelivery>;
+  viewerStartup: ViewerStartupTimeline;
+  viewerStartupAttempt: number;
+  readonly recordings: Set<Recording>;
+
+  /** Clients that opened a marked view, with its mark. They give way to a newer view on the same NVR. */
+  readonly yieldingClients: Map<VideoViewerResponse, string>;
+
+  /** Recording protection remains attached to each live response even after the bounded mark cache expires. */
+  readonly heldClients: Map<VideoViewerResponse, string>;
+
+  /** Activity-aware HA workers keep their call until HA actually closes the response. */
+  readonly hlsClients: Set<VideoViewerResponse>;
+  readonly audioConsumers: Set<(chunk: Buffer) => void>;
+  parameterSets: VideoParameterSetCache;
+  state: "idle" | "starting" | "streaming" | "stopping" | "error";
+  start: PendingSourceStart | null;
+
+  /** Viewers wait outside the retiring session until provider cleanup has completed. */
+  stop: Promise<boolean> | null;
+  source: Readable | null;
+  audioSource: Readable | null;
+  ffmpeg: ChildProcessWithoutNullStreams | null;
+  viewerFfmpeg: ChildProcessWithoutNullStreams | null;
+
+  /** Bound H.265 snapshot/conversion input. H.264 snapshots retain their existing delivery path. */
+  snapshotInput: MediaInputBound | null;
+  viewerInput: MediaInputBound | null;
+  viewerParameterSets: VideoParameterSetCache;
+  viewerInputBytes: number;
+  viewerOutputBytes: number;
+  viewerOutputChunks: number;
+  viewerInputCadence: StreamCadenceTracker;
+  viewerOutputCadence: StreamCadenceTracker;
+  viewerClientBackpressureEvents: number;
+  viewerMaximumClientWritableBytes: number;
+  viewerTranscoderSilentRestarts: number;
+  viewerTranscoderStartedAtMilliseconds: number;
+  viewerTranscoderStartedAtRandomAccessPicture: number;
+  viewerTranscoderLastOutputAtMilliseconds: number | null;
+  viewerTranscoderLastOutputRandomAccessPicture: number;
+  sourceBytes: number;
+  sourceChunks: number;
+  sourceCadence: StreamCadenceTracker;
+  viewerDeliveryBytes: number;
+  viewerDeliveryChunks: number;
+  viewerDeliveryCadence: StreamCadenceTracker;
+  viewerClientStarts: number;
+  viewerClientWrites: number;
+  model: string;
+  stopTimer: NodeJS.Timeout | null;
+  sourceQuietTimer: NodeJS.Timeout | null;
+  owned: boolean;
+  leases: number;
+  privateTrial: boolean;
+  suppressSnapshots: boolean;
+  generation: number;
+}
+
+interface Recording {
+  readonly chunks: Buffer[];
+  readonly audioChunks: Buffer[];
+  audioSize: number;
+  readonly durationMilliseconds: number;
+  readonly maximumBytes: number;
+  size: number;
+  started: boolean;
+  firstVideoAtMilliseconds: number | null;
+  lastVideoAtMilliseconds: number | null;
+  startTimer: NodeJS.Timeout;
+  durationTimer: NodeJS.Timeout | null;
+  resolve: (data: { video: Buffer; audio: Buffer; frameRate?: number }) => void;
+  reject: (error: Error) => void;
+}
+
+type ClipRemuxer = (video: Buffer, codec: VideoCodec, audio?: Buffer, signal?: AbortSignal, frameRate?: number) => Promise<Buffer>;
+type ViewerTranscoderFactory = () => ChildProcessWithoutNullStreams;
+type SnapshotExtractorFactory = (codec: VideoCodec) => ChildProcessWithoutNullStreams;
+
+const MAX_RECORDING_BYTES = 256 * 1024 * 1024;
+const MAX_DELIVERED_VIEWS = 1024;
+
+// Longer than a call takes to settle, and shorter than Home Assistant's second stream retry.
+const NEW_VIEW_MILLISECONDS = 8_000;
+
+const MEDIA_PROCESS_TERMINATION_GRACE_MILLISECONDS = 2_000;
+const MAX_PARAMETER_SET_SCAN_BYTES = 1024 * 1024;
+const MAX_STARTUP_GROUP_BYTES = 1024 * 1024;
+const SILENT_TRANSCODER_RESTART_DELAY_MILLISECONDS = 5_000;
+const MAX_SILENT_TRANSCODER_RESTARTS = 2;
+const STALLED_TRANSCODER_RESTART_DELAY_MILLISECONDS = 10_000;
+
+/** Time allowed for peer lookup and a decodable fresh frame on slower cameras. */
+export const SNAPSHOT_CAPTURE_TIMEOUT_MILLISECONDS = 30_000;
+
+/**
+ * Retains the latest complete H.264 or H.265 decoder start from an Annex-B stream.
+ *
+ * Input chunks may divide NAL units arbitrarily. H.264 waits for SPS and PPS.
+ * H.265 waits for VPS, SPS, PPS, and a random-access picture because FFmpeg cannot recover a
+ * usable picture by probing Eufy's vendor headers or inter frames without that
+ * standard decoder configuration. Camera content is held only in memory and is
+ * never exposed in logs.
+ *
+ * Once the codec is known, the opening buffer follows the stream: every new
+ * random-access picture replaces it, so a viewer or transcoder that joins an
+ * existing session starts from the current group of pictures rather than the
+ * first one the session ever saw. The buffer starts at the first slice of that
+ * picture, which keeps multi-slice keyframes whole.
+ * Provider hints may correct a provisional codec until complete decoder headers
+ * are retained. A late correction waits for repeated headers if earlier sets
+ * were consumed under the wrong codec. Encoding changes after bootstrap require
+ * a new source session.
+ */
+export class VideoParameterSetCache {
+  #pending = Buffer.alloc(0);
+  #codec: VideoCodec | null = null;
+  #observedCodec: VideoCodec | null = null;
+  #alternateVps: Buffer | null = null;
+  #alternateSps: Buffer | null = null;
+  #alternatePps: Buffer | null = null;
+  #openingChunks: Buffer[] = [];
+  #openingBytes = 0;
+  #openingHeaders: Buffer | null = null;
+  #pictureHeadersPayloadOffset = -1;
+  #pictureHeaders: Buffer | null = null;
+  #unidentifiedChunks: Buffer[] = [];
+  #unidentifiedBytes = 0;
+  #receivedBytes = 0;
+  #lastScannedPayload = -1;
+  #randomAccessPictures = 0;
+  #keyframeContinuationNals = 0;
+  #startupGroupOverflows = 0;
+  #openingCurrent = false;
+  #scanTail = Buffer.alloc(0);
+  #vps: Buffer | null = null;
+  #sps: Buffer | null = null;
+  #pps: Buffer | null = null;
+
+  /** Return the codec identified by complete parameter-set NAL units. */
+  get codec(): VideoCodec | null {
+    return this.#codec;
+  }
+
+  /**
+   * Return whether {@link startup} already contains the most recently pushed chunk.
+   *
+   * An oversized group is discarded. Existing consumers continue receiving live
+   * bytes, while new decoders wait for the next retained random-access picture.
+   */
+  get startupIncludesLatest(): boolean {
+    return this.#openingCurrent;
+  }
+
+  /** Return headers captured at the current keyframe followed by its retained group. */
+  get startup(): Buffer | null {
+    const headers = this.#openingHeaders ?? this.bootstrap;
+    return headers && this.#openingCurrent
+      ? Buffer.concat([headers, ...this.#openingChunks], headers.length + this.#openingBytes)
+      : null;
+  }
+
+  /** Return content-free source-session counters. Later slices are normal keyframe traffic. */
+  get diagnostics(): { randomAccessPictures: number; keyframeContinuationNals: number; startupGroupOverflows: number } {
+    return {
+      randomAccessPictures: this.#randomAccessPictures,
+      keyframeContinuationNals: this.#keyframeContinuationNals,
+      startupGroupOverflows: this.#startupGroupOverflows,
+    };
+  }
+
+  /** Return codec headers in decoder order once every required set is known. */
+  get bootstrap(): Buffer | null {
+    if (this.#codec === "h265") {
+      return this.#vps && this.#sps && this.#pps
+        ? Buffer.concat([this.#vps, this.#sps, this.#pps])
+        : null;
+    }
+    return this.#codec === "h264" && this.#sps && this.#pps
+      ? Buffer.concat([this.#sps, this.#pps])
+      : null;
+  }
+
+  /** Inspect ordered bytes, allowing provider metadata to correct an unbootstrapped codec. */
+  push(chunk: Buffer, declaredCodec?: VideoCodec | null): void {
+    const previousCodec = this.#codec;
+    if (declaredCodec && declaredCodec !== this.#codec && this.bootstrap === null && this.#observedCodec === null) {
+      this.#selectCodec(declaredCodec);
+    }
+    this.#scanParameterSets(chunk);
+    const tail = this.#scanTail;
+    const window = Buffer.concat([tail, chunk]);
+    const windowOffset = this.#receivedBytes - tail.length;
+    this.#receivedBytes += chunk.length;
+    this.#scanTail = Buffer.from(window.subarray(Math.max(0, window.length - RANDOM_ACCESS_SCAN_OVERLAP)));
+    if (this.#codec === null) {
+      this.#unidentifiedChunks.push(Buffer.from(chunk));
+      this.#unidentifiedBytes += chunk.length;
+      while (this.#unidentifiedBytes > MAX_STARTUP_GROUP_BYTES && this.#unidentifiedChunks.length) {
+        this.#unidentifiedBytes -= this.#unidentifiedChunks.shift()!.length;
+      }
+      return;
+    }
+
+    // Only the codec transition needs to revisit bytes received before identification.
+    const scan = previousCodec === null && this.#unidentifiedBytes > 0
+      ? Buffer.concat([...this.#unidentifiedChunks, chunk])
+      : window;
+    const scanOffset = previousCodec === null && this.#unidentifiedBytes > 0
+      ? this.#receivedBytes - scan.length
+      : windowOffset;
+    this.#unidentifiedChunks = [];
+    this.#unidentifiedBytes = 0;
+    let openingOffset: number | null = null;
+    let openingPayloadOffset = -1;
+    for (const start of annexBStarts(scan)) {
+      const header = scan[start.payloadOffset];
+      if (header === undefined) continue;
+      const type = this.#codec === "h264" ? header & 0x1f : (header >> 1) & 0x3f;
+      const keyframe = this.#codec === "h264" ? type === 5 : type >= 19 && type <= 21;
+      const slice = scan[start.payloadOffset + (this.#codec === "h264" ? 1 : 2)];
+      const absolutePayload = scanOffset + start.payloadOffset;
+      if (!keyframe || slice === undefined || absolutePayload <= this.#lastScannedPayload) continue;
+      this.#lastScannedPayload = absolutePayload;
+      if ((slice & 0x80) !== 0) {
+        this.#randomAccessPictures += 1;
+        openingOffset = start.offset;
+        openingPayloadOffset = absolutePayload;
+      } else {
+        this.#keyframeContinuationNals += 1;
+      }
+    }
+    if (openingOffset !== null) {
+      this.#openingChunks = [Buffer.from(scan.subarray(openingOffset))];
+      this.#openingBytes = scan.length - openingOffset;
+      this.#openingHeaders = this.#pictureHeadersPayloadOffset === openingPayloadOffset
+        ? this.#pictureHeaders
+        : this.bootstrap;
+      this.#openingCurrent = true;
+    } else if (this.#openingCurrent) {
+      this.#openingChunks.push(Buffer.from(chunk));
+      this.#openingBytes += chunk.length;
+    }
+    if (this.#openingCurrent && this.#openingBytes > MAX_STARTUP_GROUP_BYTES) {
+      this.#startupGroupOverflows += 1;
+      this.#openingChunks = [];
+      this.#openingBytes = 0;
+      this.#openingHeaders = null;
+      this.#pictureHeaders = null;
+      this.#pictureHeadersPayloadOffset = -1;
+      this.#openingCurrent = false;
+    }
+  }
+
+  #capturePictureHeaders(data: Buffer, start: { payloadOffset: number }, baseOffset: number): void {
+    const codec = this.#codec;
+    const header = data[start.payloadOffset];
+    if (!codec || header === undefined) return;
+    const type = codec === "h264" ? header & 0x1f : (header >> 1) & 0x3f;
+    const randomAccess = codec === "h264" ? type === 5 : type >= 19 && type <= 21;
+    const slice = data[start.payloadOffset + (codec === "h264" ? 1 : 2)];
+    const absolutePayload = baseOffset + start.payloadOffset;
+    if (!randomAccess || slice === undefined || (slice & 0x80) === 0
+      || absolutePayload <= this.#pictureHeadersPayloadOffset) return;
+
+    // Capture in NAL order, before later parameter sets in this chunk are accepted.
+    this.#pictureHeadersPayloadOffset = absolutePayload;
+    this.#pictureHeaders = this.bootstrap;
+  }
+
+  #scanParameterSets(chunk: Buffer): void {
+    const baseOffset = this.#receivedBytes - this.#pending.length;
+    const data = this.#pending.length > 0 ? Buffer.concat([this.#pending, chunk]) : chunk;
+    const starts = annexBStarts(data);
+    if (starts.length < 2) {
+      if (starts[0]) this.#capturePictureHeaders(data, starts[0], baseOffset);
+      this.#pending = data.length <= MAX_PARAMETER_SET_SCAN_BYTES
+        ? Buffer.from(data)
+        : Buffer.from(data.subarray(data.length - 3));
+      return;
+    }
+    for (let index = 0; index < starts.length - 1; index++) {
+      const current = starts[index]!;
+      const next = starts[index + 1]!;
+      const header = data[current.payloadOffset]!;
+      const h264Type = header & 0x1f;
+      const h265Type = (header >> 1) & 0x3f;
+      const nal = Buffer.from(data.subarray(current.offset, next.offset));
+      if (this.#codec === "h264" && (h264Type === 7 || h264Type === 8)) {
+        if (h264Type === 7) this.#sps = nal;
+        else this.#pps = nal;
+        if (this.#sps && this.#pps) this.#observedCodec = "h264";
+      } else if (this.#codec === "h265" && (h265Type === 32 || h265Type === 33 || h265Type === 34)) {
+        if (h265Type === 32) this.#vps = nal;
+        else if (h265Type === 33) this.#sps = nal;
+        else this.#pps = nal;
+        if (this.#vps && this.#sps && this.#pps) this.#observedCodec = "h265";
+      } else if (this.#codec === "h265" && (h264Type === 7 || h264Type === 8)) {
+        if (h264Type === 7) this.#alternateSps = nal;
+        else this.#alternatePps = nal;
+        if (this.#alternateSps && this.#alternatePps) {
+          const sps = this.#alternateSps, pps = this.#alternatePps;
+          this.#selectCodec("h264");
+          this.#sps = sps;
+          this.#pps = pps;
+          this.#observedCodec = "h264";
+        }
+      } else if (this.#codec === "h264" && (header & 0x01) === 0 && (h265Type === 32 || h265Type === 33 || h265Type === 34)) {
+        if (h265Type === 32) this.#alternateVps = nal;
+        else if (h265Type === 33) this.#alternateSps = nal;
+        else this.#alternatePps = nal;
+        if (this.#alternateVps && this.#alternateSps && this.#alternatePps) {
+          const vps = this.#alternateVps, sps = this.#alternateSps, pps = this.#alternatePps;
+          this.#selectCodec("h265");
+          this.#vps = vps;
+          this.#sps = sps;
+          this.#pps = pps;
+          this.#observedCodec = "h265";
+        }
+      } else if (this.#codec === null && (header & 0x01) === 0 && (h265Type === 32 || h265Type === 33 || h265Type === 34)) {
+        this.#codec = "h265";
+        this.#vps = h265Type === 32 ? nal : null;
+        this.#sps = h265Type === 33 ? nal : null;
+        this.#pps = h265Type === 34 ? nal : null;
+      } else if (this.#codec === null && (h264Type === 7 || h264Type === 8)) {
+        if (h264Type === 7) this.#sps = nal;
+        else this.#pps = nal;
+        if (this.#sps && this.#pps) this.#codec = "h264";
+      }
+      this.#capturePictureHeaders(data, current, baseOffset);
+    }
+    this.#capturePictureHeaders(data, starts.at(-1)!, baseOffset);
+    this.#pending = Buffer.from(data.subarray(starts.at(-1)!.offset));
+  }
+
+  /** Replace only provisional codec state while retaining transport diagnostics. */
+  #selectCodec(codec: VideoCodec): void {
+    this.#codec = codec;
+    this.#observedCodec = null;
+    this.#vps = null;
+    this.#sps = null;
+    this.#pps = null;
+    this.#alternateVps = null;
+    this.#alternateSps = null;
+    this.#alternatePps = null;
+    this.#pictureHeaders = null;
+    this.#pictureHeadersPayloadOffset = -1;
+    this.#openingChunks = [];
+    this.#openingBytes = 0;
+    this.#openingHeaders = null;
+    this.#openingCurrent = false;
+    this.#randomAccessPictures = 0;
+    this.#keyframeContinuationNals = 0;
+    this.#startupGroupOverflows = 0;
+  }
+}
+
+/** Bytes re-scanned across chunk boundaries so a split start code or slice header is not missed. */
+const RANDOM_ACCESS_SCAN_OVERLAP = 8;
+
+function annexBStarts(data: Buffer): Array<{ offset: number; payloadOffset: number }> {
+  const starts: Array<{ offset: number; payloadOffset: number }> = [];
+  for (let offset = 0; offset + 3 < data.length;) {
+    if (data[offset] !== 0 || data[offset + 1] !== 0) {
+      offset++;
+      continue;
+    }
+    const length = data[offset + 2] === 1 ? 3 : data[offset + 2] === 0 && data[offset + 3] === 1 ? 4 : 0;
+    if (length === 0) {
+      offset++;
+      continue;
+    }
+    starts.push({ offset, payloadOffset: offset + length });
+    offset += length;
+  }
+  return starts;
+}
+
+/**
+ * Coordinates one shared source per camera.
+ *
+ * HTTP viewers receive H.264 directly or share one H.265-to-H.264 transcoder,
+ * while a separate FFmpeg process receives the source for retained JPEG
+ * snapshots. MP4 clips retain the original camera codec and include optional
+ * provider-validated AAC. Transport viewers multiplex it without retaining a recording. Ownership counts
+ * avoid duplicate camera sessions, and the idle grace period prevents
+ * refreshes from repeatedly opening and closing a camera.
+ */
+export class LiveStreamManager extends EventEmitter {
+  readonly #sessions = new Map<string, Session>();
+  readonly #lensViews = new Map<string, SharedLensViews>();
+  readonly #deliveredViews = new Set<string>();
+  readonly #newViews = new Map<string, number>();
+  readonly #heldViews = new Set<string>();
+  #closed = false;
+
+  /**
+   * Create a manager with state, image storage, provider, and idle grace.
+   *
+   * @param sourceQuietMilliseconds Maximum silence after source bytes first arrive.
+   * Startup remains governed by the provider's separate first-frame deadline.
+   * @param nowMilliseconds Monotonic clock used for bounded decoder recovery.
+   * @param experimentalS340SmoothLive Enable six-second transport-only pacing on the qualified S340 route.
+   */
+  constructor(
+    private readonly state: GatewayState,
+    private readonly snapshots: SnapshotStore,
+    private readonly controller: StreamController,
+    private readonly stopGraceMilliseconds: number,
+    private readonly remuxClip: ClipRemuxer = remuxVideoToMp4,
+    private readonly createViewerTranscoder: ViewerTranscoderFactory = spawnH265ViewerTranscoder,
+    private readonly createSnapshotExtractor: SnapshotExtractorFactory = spawnSnapshotExtractor,
+    private readonly sourceQuietMilliseconds = 30_000,
+    private readonly nowMilliseconds: () => number = () => performance.now(),
+    private readonly experimentalS340SmoothLive = false,
+    private readonly createLensConverter: SharedLensConverterFactory = spawnSharedLensConverter,
+  ) {
+    super();
+  }
+
+  /**
+   * Attach a viewer to a shared source start. A retiring source finishes before
+   * registration, so its stop notification cannot close this new request.
+   * Startup failures reach every waiter. Closed requests never start a source.
+   */
+  addClient(serial: string, response: VideoViewerResponse, profile: ViewerProfile = "compatible", view?: string): Promise<void> {
+    return this.#addClient(serial, response, profile, performance.now(), view);
+  }
+
+  /** Share both pane outputs through one unmarked native viewer, protecting its camera call. */
+  async addLensClient(serial: string, lens: SharedLens, response: VideoViewerResponse): Promise<void> {
+    if (this.#closed || response.destroyed || response.writableEnded) return;
+    const admitted = (): boolean => {
+      if (!this.state.hasCamera(serial)) return false;
+      const camera = this.state.getCamera(serial);
+      return camera.model === "T8E00" && camera.nvrLiveControlsSupported === true && camera.nvrSelectedView === 2;
+    };
+    if (!admitted()) throw new Error("Select the admitted NVR Both view before opening a lens");
+    let pair = this.#lensViews.get(serial);
+    const fresh = !pair;
+    if (!pair) {
+      const owned = new SharedLensViews(() => new VideoParameterSetCache(), this.createLensConverter,
+        terminateMediaProcess, reason => {
+          if (this.#lensViews.get(serial) === owned) this.#lensViews.delete(serial);
+          this.emit("shared-lens-closed", { model: "T8E00", reason });
+        }, admitted);
+      pair = owned; this.#lensViews.set(serial, owned);
+    }
+    pair.add(lens, response);
+    if (fresh) {
+      try { await this.addClient(serial, pair.input, "native"); }
+      catch (error) { pair.close(); throw error; }
+    }
+  }
+
+  /** Keep the original request clock across retirement and transport setup. */
+  async #addClient(serial: string, response: VideoViewerResponse, profile: ViewerProfile, requestedAtMilliseconds: number, view?: string): Promise<void> {
+    if (response.destroyed || response.writableEnded) return;
+    const session = this.#session(serial);
+    const mayTakeCall = !!view && this.#viewMayTakeCall(view);
+    this.#assertShareable(session);
+    if (session.stop) {
+      if (!await this.#waitForStop(session, response)) return;
+      this.#assertShareable(session);
+    }
+    this.#cancelStop(session);
+    session.clients.add(response);
+    if (view) (this.#heldViews.has(view) ? session.heldClients : session.yieldingClients).set(response, view);
+    if (view?.startsWith("hls1_")) session.hlsClients.add(response);
+    session.clientDeliveries.set(response, {
+      closeReason: null,
+      sourceAttached: session.source !== null,
+      profile,
+      startedCodec: null,
+      requestedAtMilliseconds,
+      startupReported: false,
+      attemptFirstWriteAtMilliseconds: null,
+      randomAccessQueuedAtMilliseconds: null,
+      deliveryStarted: false,
+      firstWriteAtMilliseconds: null,
+      lastWriteAtMilliseconds: null,
+      deliveredBytes: 0,
+      deliveredChunks: 0,
+      backpressureEvents: 0,
+      maximumWritableBytes: 0,
+    });
+    const sourceCodec = session.parameterSets.codec;
+
+    // A viewer joining a running source starts from the current keyframe so it
+    // shows a picture now instead of waiting for the camera's next one.
+    const viewerParameterSets = sourceCodec === "h265" && profile === "compatible" ? session.viewerParameterSets : session.parameterSets;
+    const viewerBootstrap = viewerParameterSets.bootstrap && viewerParameterSets.startupIncludesLatest
+      ? viewerParameterSets.startup ?? viewerParameterSets.bootstrap
+      : viewerParameterSets.bootstrap;
+    const viewerCodec = sourceCodec === "h265" && profile === "compatible" ? "h264" : sourceCodec;
+
+    // Headers retained from a stopped source belong to its old encoding session.
+    // Wait for the replacement source instead of sending two HTTP header blocks.
+    if (session.source && session.state === "streaming" && viewerBootstrap && viewerCodec) {
+      this.#startClient(session, response, viewerCodec, viewerBootstrap, viewerParameterSets.startupIncludesLatest);
+    } else {
+      session.pendingClients.add(response);
+      const startup = session.parameterSets.startup;
+
+      // Any other marked view is a retry from a client that lost the call. It will
+      // most likely be refused, so don't spend a conversion on its old picture.
+      if (profile === "compatible" && sourceCodec === "h265" && startup && !session.viewerFfmpeg && (!view || mayTakeCall)) {
+        this.#startViewerTranscoder(serial, session, startup);
+      }
+    }
+    this.#updateState(serial, session);
+
+    response.on("close", () => this.#removeClient(serial, response));
+    response.once("error", (error) => {
+      this.#markViewerClose(session, response, "consumer_error");
+      this.emit("warning", error);
+      this.#removeClient(serial, response);
+    });
+
+    // Start the provider only after the HTTP client is registered so the first
+    // video bytes can be fanned out to Home Assistant immediately.
+    try {
+      await this.#ensureStarted(serial, session, mayTakeCall);
+      if (view) this.#rememberDeliveredView(view);
+    } catch (error) {
+      this.#markViewerClose(session, response, "start_failed");
+      response.destroy(error instanceof Error ? error : undefined);
+    }
+  }
+
+  /**
+   * A person's new view opens at once. Home Assistant retries a stream for a long
+   * while after its viewer has gone, so a mark that is no longer new must not take
+   * the call from whatever is being watched by then.
+   */
+  #viewMayTakeCall(view: string): boolean {
+    if (this.#deliveredViews.has(view)) return false;
+    const now = this.nowMilliseconds();
+    const first = this.#newViews.get(view) ?? now;
+    if (!this.#newViews.has(view)) {
+      this.#newViews.set(view, now);
+      if (this.#newViews.size > MAX_DELIVERED_VIEWS) this.#newViews.delete(this.#newViews.keys().next().value!);
+    }
+    return now - first < NEW_VIEW_MILLISECONDS;
+  }
+
+  /**
+   * A view that has started can never take a call again. Home Assistant reuses
+   * its URL when it retries a dropped stream, so a camera that lost the call
+   * cannot take it back from the camera that was opened after it.
+   */
+  #rememberDeliveredView(view: string): void {
+    this.#deliveredViews.add(view);
+    if (this.#deliveredViews.size > MAX_DELIVERED_VIEWS) this.#deliveredViews.delete(this.#deliveredViews.values().next().value!);
+  }
+
+  /**
+   * Share a video source with a bounded MPEG-TS muxer and checked camera audio.
+   * Wait for retirement before registering either media consumer, keeping audio
+   * from the old source out of a new viewer's startup buffer. The native profile
+   * carries the camera's own video unconverted; compatible carries H.264.
+   */
+  async addTransportClient(serial: string, response: ServerResponse, profile: ViewerProfile = "compatible", view?: string): Promise<void> {
+    const requestedAtMilliseconds = performance.now();
+    if (response.destroyed || response.writableEnded) return;
+    const session = this.#session(serial);
+    this.#assertShareable(session);
+    if (session.stop) {
+      if (!await this.#waitForStop(session, response)) return;
+      this.#assertShareable(session);
+    }
+    const audioWait = liveAudioStartWaitMilliseconds(this.state.getCamera(serial));
+    const model = this.state.getCamera(serial).model;
+    const stopped = (reason: string): void => { this.emit("warning", new Error(`Camera live transport stopped: reason=${reason}`)); };
+    if (profile === "native") {
+      const muxer = new NativeTransportMuxer(response, () => session.audioConsumers.delete(consumeNative), audioWait, stopped,
+        summary => this.emit("native-transport-closed", { model, ...summary }));
+      const consumeNative = (chunk: Buffer): void => muxer.acceptAudio(chunk);
+      session.audioConsumers.add(consumeNative);
+      await this.#addClient(serial, muxer.videoInput, "native", requestedAtMilliseconds, view);
+      return;
+    }
+    const consumeAudio = (chunk: Buffer): void => muxer.acceptAudio(chunk);
+    const muxer = new LiveTransportMuxer(response, () => session.audioConsumers.delete(consumeAudio), audioWait,
+      stopped, () => this.experimentalS340SmoothLive && qualifiedS340LiveSource(session.source),
+      summary => this.emit("live-pacing-closed", summary),
+      summary => this.emit("live-audio-startup-closed", { model, ...summary }));
+    session.audioConsumers.add(consumeAudio);
+    await this.#addClient(serial, muxer.videoInput, "compatible", requestedAtMilliseconds, view);
+  }
+
+  /** Capture one fresh JPEG through the shared source and return its metadata. */
+  async captureSnapshot(
+    serial: string,
+    timeoutMilliseconds = SNAPSHOT_CAPTURE_TIMEOUT_MILLISECONDS,
+  ): Promise<SnapshotInfo> {
+    if (this.#closed) throw new Error("Gateway closed before snapshot capture started");
+    const session = this.#session(serial);
+    this.#assertShareable(session);
+    const previousRevision = this.state.getCamera(serial).snapshot?.revision ?? 0;
+    this.#cancelStop(session);
+    session.leases += 1;
+    this.#updateState(serial, session);
+    const nextSnapshot = this.#waitForSnapshot(serial, previousRevision, timeoutMilliseconds);
+
+    // PPCS startup can outlast the frame timer. Handle an early timeout now,
+    // while still propagating it when startup settles and capture awaits it.
+    void nextSnapshot.promise.catch(() => undefined);
+    try {
+      await this.#ensureStarted(serial, session);
+      return await nextSnapshot.promise;
+    } finally {
+      nextSnapshot.cancel();
+      session.leases -= 1;
+      this.#scheduleStopIfUnused(serial, session);
+    }
+  }
+
+  /**
+   * Retain a decoded source while a camera operation shares its connection.
+   *
+   * A fresh live image establishes readiness before the callback runs. The lease
+   * prevents idle cleanup during the operation and is released on every exit,
+   * without cancelling other viewers or extending the source's maximum lifetime.
+   */
+  async withLiveSource<T>(serial: string, operation: () => Promise<T>): Promise<T> {
+    if (this.#closed) throw new Error("Gateway closed before camera operation started");
+    const session = this.#session(serial);
+    this.#assertShareable(session);
+    this.#cancelStop(session);
+    session.leases += 1;
+    this.#updateState(serial, session);
+    try {
+      await this.captureSnapshot(serial);
+      return await operation();
+    } finally {
+      session.leases -= 1;
+      this.#scheduleStopIfUnused(serial, session);
+    }
+  }
+
+  /** True only for a decoded normal source with a real attached viewer. */
+  hasActiveViewer(serial: string): boolean {
+    const session = this.#sessions.get(serial);
+    return !!session && !session.privateTrial && session.state === "streaming" && !!session.source && session.clients.size > 0;
+  }
+
+  /**
+   * Report a source already on its way out, without granting permission to stop it.
+   * An idle grace timer qualifies only while no viewer, lease or recording owns
+   * the source. A new consumer cancels that timer before this can return true.
+   */
+  isSourceRetiring(serial: string): boolean {
+    const session = this.#sessions.get(serial);
+    return !!session && !session.privateTrial && (!!session.stop
+      || !!session.stopTimer && session.clients.size === 0 && session.leases === 0 && session.recordings.size === 0);
+  }
+
+  /** Allow bounded handoff waiting while startup, retirement or HA idle cleanup may release this call. */
+  isSourceSettling(serial: string): boolean {
+    const session = this.#sessions.get(serial);
+    return !!session && !session.privateTrial && (!!session.start || !!session.stop
+      || session.hlsClients.size > 0 && session.leases === 0 && session.recordings.size === 0 && session.heldClients.size === 0
+        && [...session.clients].every(client => session.yieldingClients.has(client)));
+  }
+
+  /**
+   * True when only marked views use this source, so its NVR call may move to
+   * another camera. Leases, clips, unmarked consumers and starting or stopping
+   * sources always keep the call. Activity-aware HA workers keep it until their response closes.
+   */
+  canYieldSource(serial: string): boolean {
+    const session = this.#sessions.get(serial);
+    return !!session && !session.privateTrial && session.state === "streaming" && !!session.source && !session.start && !session.stop
+      && session.leases === 0 && session.recordings.size === 0
+      && [...session.clients].every(client => session.yieldingClients.has(client) && !session.hlsClients.has(client));
+  }
+
+  /**
+   * Retire only a fully started source whose consumers all permit takeover.
+   * The stop gate is installed synchronously before provider cleanup is awaited,
+   * so new viewers wait and late recording holds cannot promise this old source.
+   * Returns false without stopping a lease, recording or unmarked consumer.
+   * The unused-only form also requires the existing idle grace timer and zero
+   * consumers, checked synchronously before that timer is cancelled.
+   */
+  async retireYieldableSource(serial: string, onlyIfUnused = false): Promise<boolean> {
+    const session = this.#sessions.get(serial);
+    if (this.#closed || !session || !this.canYieldSource(serial)
+      || onlyIfUnused && (!session.stopTimer || session.clients.size !== 0)) return false;
+    this.#cancelStop(session);
+    return this.#stopOwnedSource(serial, session);
+  }
+
+  /**
+   * Home Assistant is recording from a marked view, so it must keep its call.
+   * It records over the connection the view already has, so the gateway sees no
+   * new consumer. The mark stays held, and a reconnect with it keeps the call too.
+   * Returns whether an open connection uses the mark, including an already held
+   * connection, so retrying after a lost acknowledgment is safe.
+   */
+  holdView(serial: string, view: string): boolean {
+    const session = this.#sessions.get(serial);
+    if (session?.stop && !this.#heldViews.has(view)) return false;
+    this.#heldViews.add(view);
+    if (this.#heldViews.size > MAX_DELIVERED_VIEWS) this.#heldViews.delete(this.#heldViews.values().next().value!);
+    if (!session) return false;
+    const clients = [...session.yieldingClients].filter(([, mark]) => mark === view).map(([client]) => client);
+    for (const client of clients) {
+      session.yieldingClients.delete(client);
+      session.heldClients.set(client, view);
+    }
+    return [...session.heldClients.values()].includes(view);
+  }
+
+  /** Identify local clip consumers so control admission can reject recording conflicts. */
+  hasActiveRecording(serial: string): boolean {
+    return (this.#sessions.get(serial)?.recordings.size ?? 0) > 0;
+  }
+
+  /** Retain an existing viewed source without capturing or waiting for a new image. */
+  async withActiveViewer<T>(serial: string, operation: () => Promise<T>): Promise<T> {
+    if (this.#closed || !this.hasActiveViewer(serial)) throw new Error("An active live viewer is required");
+    const session = this.#sessions.get(serial)!;
+    this.#assertShareable(session); this.#cancelStop(session); session.leases++;
+    try { return await operation(); }
+    finally { session.leases--; this.#scheduleStopIfUnused(serial, session); }
+  }
+
+  /** Capture one startup image and release its unused source immediately. */
+  async captureStartupSnapshot(
+    serial: string,
+    timeoutMilliseconds = SNAPSHOT_CAPTURE_TIMEOUT_MILLISECONDS,
+  ): Promise<SnapshotInfo> {
+    this.#assertShareable(this.#session(serial));
+    try {
+      return await this.captureSnapshot(serial, timeoutMilliseconds);
+    } finally {
+      await this.#stopNowIfUnused(serial, this.#session(serial));
+    }
+  }
+
+  /** Whether existing viewers, leases or a source prevent an exclusive diagnostic trial. */
+  hasActiveSession(serial: string): boolean {
+    const session = this.#sessions.get(serial);
+    return !!session && (session.owned || session.leases > 0 || session.clients.size > 0 || session.source !== null);
+  }
+
+  /**
+   * Record a bounded H.264 or H.265 segment and package it as fragmented MP4.
+   * Private trials require an exclusive idle source, suppress retained snapshots
+   * and diagnostic capture, and await source retirement before returning.
+   */
+  async recordClip(
+    serial: string,
+    durationSeconds: number,
+    startTimeoutMilliseconds = 20_000,
+    privateTrial = false,
+    signal?: AbortSignal,
+    options?: { readonly maximumRecordingBytes?: number },
+  ): Promise<Buffer> {
+    if (!Number.isInteger(durationSeconds) || durationSeconds < 1 || durationSeconds > 120) {
+      throw new Error("Recording duration must be between 1 and 120 seconds");
+    }
+    if (signal?.aborted) throw mediaAbortError();
+    const maximumBytes = options?.maximumRecordingBytes ?? MAX_RECORDING_BYTES;
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1 || maximumBytes > MAX_RECORDING_BYTES) throw new Error("Invalid recording byte limit");
+    const session = this.#session(serial);
+    this.#assertShareable(session);
+    if (privateTrial && (session.source || session.owned || !["idle", "error"].includes(session.state)
+      || session.clients.size || session.pendingClients.size || session.audioConsumers.size || session.recordings.size || session.leases)) {
+      throw new Error("Stop other video activity before this private test");
+    }
+    if (privateTrial) session.privateTrial = true;
+    let leased = false, startSettled = true, abandoned = false;
+    let recording: { promise: Promise<{ video: Buffer; audio: Buffer; frameRate?: number }>; cancel: () => void } | undefined;
+    let rejectAbort!: (error: Error) => void;
+    const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+    void aborted.catch(() => {});
+    const abort = (): void => { recording?.cancel(); rejectAbort(mediaAbortError()); };
+    signal?.addEventListener("abort", abort, { once: true });
+    const retireLate = async (): Promise<void> => {
+      try { await this.controller.stopStream(serial); }
+      finally { try { this.markStopped(serial); } finally { session.privateTrial = false; } }
+    };
+    try {
+      this.#cancelStop(session);
+      session.leases += 1; leased = true;
+      this.#updateState(serial, session);
+      recording = this.#collectRecording(session, durationSeconds * 1_000, startTimeoutMilliseconds, maximumBytes);
+      void recording.promise.catch(() => undefined);
+      startSettled = false;
+      const startup = this.#ensureStarted(serial, session);
+      void startup.then(() => {
+        startSettled = true;
+        if (abandoned) void retireLate().catch(() => {});
+      }, () => {
+        startSettled = true;
+        if (abandoned) { try { this.markStopped(serial); } finally { session.privateTrial = false; } }
+      }).catch(() => {});
+      if (signal?.aborted) abort();
+      await Promise.race([startup, aborted]);
+      if (signal?.aborted) throw mediaAbortError();
+      const recorded = await Promise.race([recording.promise, aborted]);
+      if (signal?.aborted) throw mediaAbortError();
+      const codec = session.parameterSets.codec ?? "h264";
+      const clip = signal ? await this.remuxClip(recorded.video, codec, recorded.audio, signal, recorded.frameRate)
+        : await this.remuxClip(recorded.video, codec, recorded.audio, undefined, recorded.frameRate);
+      if (signal?.aborted) throw mediaAbortError();
+      return clip;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      recording?.cancel();
+      if (leased) session.leases -= 1;
+      if (privateTrial) {
+        if (!startSettled) abandoned = true;
+        else session.privateTrial = false;
+        await this.#stopNowIfUnused(serial, session);
+      } else this.#scheduleStopIfUnused(serial, session);
+    }
+  }
+
+  /** Attach session-owned video and AAC, forwarding audio to viewers and retaining it only for active clips. */
+  attachSource(serial: string, source: Readable, codecHint: () => VideoCodec | null = () => null, audio?: Readable): void {
+    const session = this.#session(serial);
+    this.#cleanupSource(session);
+    session.suppressSnapshots = session.privateTrial;
+    const generation = session.generation;
+    session.source = source;
+    for (const delivery of session.clientDeliveries.values()) delivery.sourceAttached = true;
+    session.audioSource = audio ?? null;
+    audio?.on("data", (chunk: Buffer) => {
+      if (session.generation !== generation || chunk.length === 0) return;
+      if (!session.privateTrial && !session.suppressSnapshots && this.listenerCount("diagnostic-media")) {
+        this.emit("diagnostic-media", { serial, kind: "audio", codec: "aac", data: chunk } satisfies DiagnosticMedia);
+      }
+      for (const consume of session.audioConsumers) consume(chunk);
+      for (const recording of [...session.recordings]) {
+        if (!recording.started) continue;
+        if (recording.audioSize + recording.size + chunk.length > recording.maximumBytes) {
+          this.#settleRecording(session, recording, new Error(recording.maximumBytes === MAX_RECORDING_BYTES
+            ? "Recording exceeded the 256 MB safety limit" : "Recording exceeded its byte limit"));
+          continue;
+        }
+        recording.audioChunks.push(Buffer.from(chunk));
+        recording.audioSize += chunk.length;
+      }
+    });
+    audio?.on("error", (error) => {
+      if (session.generation !== generation) return;
+      this.#failRecordings(session, new Error("Camera audio source failed"));
+      this.emit("warning", error);
+    });
+    session.state = "streaming";
+    session.parameterSets = new VideoParameterSetCache();
+    session.viewerStartup = new ViewerStartupTimeline();
+    session.viewerStartupAttempt = session.generation;
+    for (const delivery of session.clientDeliveries.values()) {
+      delivery.startupReported = false; delivery.attemptFirstWriteAtMilliseconds = null;
+      delivery.randomAccessQueuedAtMilliseconds = null;
+    }
+    session.viewerParameterSets = new VideoParameterSetCache();
+    for (const client of session.clients) session.pendingClients.add(client);
+    session.ffmpeg = null;
+    session.viewerFfmpeg = null;
+    session.snapshotInput = null;
+    session.viewerInput = null;
+    session.viewerInputBytes = 0;
+    session.viewerOutputBytes = 0;
+    session.viewerOutputChunks = 0;
+    session.viewerInputCadence = new StreamCadenceTracker();
+    session.viewerOutputCadence = new StreamCadenceTracker();
+    session.viewerClientBackpressureEvents = 0;
+    session.viewerMaximumClientWritableBytes = 0;
+    session.viewerTranscoderSilentRestarts = 0;
+    session.viewerTranscoderStartedAtMilliseconds = 0;
+    session.viewerTranscoderStartedAtRandomAccessPicture = 0;
+    session.viewerTranscoderLastOutputAtMilliseconds = null;
+    session.viewerTranscoderLastOutputRandomAccessPicture = 0;
+    session.sourceBytes = 0;
+    session.sourceChunks = 0;
+    session.sourceCadence = new StreamCadenceTracker();
+    session.viewerDeliveryBytes = 0;
+    session.viewerDeliveryChunks = 0;
+    session.viewerDeliveryCadence = new StreamCadenceTracker();
+    session.viewerClientStarts = 0;
+    session.viewerClientWrites = 0;
+    session.model = this.state.getCamera(serial).model;
+
+    source.on("data", (chunk: Buffer) => {
+      if (session.generation !== generation) return;
+      if (chunk.length === 0) return;
+      session.viewerStartup.sourceByte();
+      if (!session.privateTrial && !session.suppressSnapshots && this.listenerCount("diagnostic-media")) {
+        this.emit("diagnostic-media", { serial, kind: "video", codec: codecHint() ?? "unknown", data: chunk } satisfies DiagnosticMedia);
+      }
+      if (session.sourceQuietTimer) clearTimeout(session.sourceQuietTimer);
+      session.sourceQuietTimer = setTimeout(() => {
+        if (session.generation !== generation || this.#closed) return;
+        if (session.clients.size === 0 && session.leases === 0) return;
+        const owned = session.owned;
+        const error = new Error("Camera video stopped arriving");
+
+        // Close stale viewers so HA can retry instead of holding a dead source.
+        // Do not reopen the camera automatically or change the retained picture.
+        if (owned) void this.#stopOwnedSource(serial, session, error).catch((stopError) => this.emit("warning", stopError));
+        else this.#sourceEnded(serial, generation, error);
+        this.emit("warning", error);
+      }, this.sourceQuietMilliseconds);
+      session.sourceQuietTimer.unref?.();
+      session.sourceBytes += chunk.length;
+      session.sourceChunks += 1;
+      session.sourceCadence.record();
+      const randomAccessPictures = session.parameterSets.diagnostics.randomAccessPictures;
+      session.parameterSets.push(chunk, codecHint());
+      const bootstrap = session.parameterSets.bootstrap;
+      const codec = session.parameterSets.codec;
+      const compatibleClients = this.#profileClients(session, "compatible");
+      const pendingNative = [...session.pendingClients].some(client => session.clientDeliveries.get(client)?.profile === "native");
+      const pendingCompatible = [...session.pendingClients].some(client => session.clientDeliveries.get(client)?.profile === "compatible");
+      const needsStartup = (!session.suppressSnapshots && !session.ffmpeg) || pendingNative
+        || (pendingCompatible && !(codec === "h265" && session.viewerFfmpeg))
+        || (codec === "h265" && compatibleClients.length > 0 && (!session.viewerFfmpeg
+          || this.#shouldRestartViewerTranscoder(session)));
+      const startup = needsStartup ? session.parameterSets.startup : null;
+
+      // A media child that fell behind starts again from the decoder start of the next keyframe.
+      // That start is built only then, so ordinary chunks never copy the retained group.
+      const keyframeStarted = session.parameterSets.diagnostics.randomAccessPictures > randomAccessPictures;
+      const restart = keyframeStarted && (session.snapshotInput?.skipping || session.viewerInput?.skipping)
+        ? startup ?? session.parameterSets.startup : null;
+      if (bootstrap && session.parameterSets.diagnostics.randomAccessPictures > 0) session.viewerStartup.sourceRandomAccess();
+      if (bootstrap && codec) {
+        for (const client of this.#profileClients(session, "native")) {
+          const previous = session.clientDeliveries.get(client)?.startedCodec;
+          if (previous && previous !== codec) { this.#markViewerClose(session, client, "codec_changed"); client.end(); this.#removeClient(serial, client); }
+        }
+        let snapshotStarted = false;
+        if (!session.suppressSnapshots && !session.ffmpeg && startup) {
+          session.ffmpeg = this.#startSnapshotExtractor(serial, codec);
+          session.snapshotInput = codec === "h265"
+            ? new MediaInputBound(session.ffmpeg.stdin, codec, this.nowMilliseconds) : null;
+          snapshotStarted = session.parameterSets.startupIncludesLatest;
+          if (session.snapshotInput) session.snapshotInput.write(startup);
+          else if (session.ffmpeg.stdin.writable) session.ffmpeg.stdin.write(startup);
+        }
+        if (codec === "h265") {
+          let transcoderSeeded = false;
+          if (compatibleClients.length > 0 && !session.viewerFfmpeg && startup) {
+            this.#startViewerTranscoder(serial, session, startup);
+            transcoderSeeded = session.parameterSets.startupIncludesLatest;
+          } else if (compatibleClients.length > 0 && session.viewerFfmpeg && startup && this.#shouldRestartViewerTranscoder(session)) {
+            this.#restartViewerTranscoder(serial, session, startup);
+            transcoderSeeded = session.parameterSets.startupIncludesLatest;
+          }
+
+          // The cached decoder start already ends with this chunk, so writing it
+          // again would feed FFmpeg the same keyframe twice.
+          if (!transcoderSeeded) this.#writeViewerTranscoderInput(session, chunk, restart);
+          this.#writeViewerChunk(session, chunk, "native");
+          if (startup) this.#startPendingClients(session, codec, startup, "native", true);
+        } else {
+          this.#writeViewerChunk(session, chunk);
+          if (startup) this.#startPendingClients(session, codec, startup, undefined, true);
+        }
+        if (!snapshotStarted) {
+          if (session.snapshotInput) session.snapshotInput.write(chunk, restart);
+          else if (session.ffmpeg?.stdin.writable) session.ffmpeg.stdin.write(chunk);
+        }
+      }
+      for (const recording of session.recordings) this.#appendRecordingChunk(session, recording, chunk);
+    });
+    source.once("error", (error) => this.#sourceEnded(serial, generation, error));
+    source.once("end", () => this.#sourceEnded(serial, generation));
+    source.once("close", () => this.#sourceEnded(serial, generation));
+    this.#updateState(serial, session);
+  }
+
+  /** Mark a provider source as stopped and fail pending consumers cleanly. */
+  markStopped(serial: string): void {
+    const session = this.#session(serial);
+    this.#cancelStop(session);
+    this.#retireStart(session, new Error("Camera stream stopped during startup"));
+    this.#failRecordings(session, new Error("Camera video stopped before the recording completed"));
+    this.#cleanupSource(session);
+    session.state = "idle";
+    session.owned = false;
+    for (const client of session.clients) { this.#markViewerClose(session, client, "provider_stopped"); client.end(); }
+    session.clients.clear();
+    session.yieldingClients.clear();
+    session.heldClients.clear();
+    session.hlsClients.clear();
+    session.pendingClients.clear();
+    this.#updateState(serial, session);
+  }
+
+  /** Stop every source and release FFmpeg processes during shutdown. */
+  async close(): Promise<void> {
+    for (const pair of this.#lensViews.values()) pair.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    this.emit("closed");
+    await Promise.all(
+      [...this.#sessions.entries()].map(async ([serial, session]) => {
+        if (session.stopTimer) clearTimeout(session.stopTimer);
+        this.#retireStart(session, new Error("Gateway closed during camera startup"));
+        this.#cleanupSource(session);
+        this.#failRecordings(session, new Error("Gateway closed while recording a clip"));
+        for (const client of session.clients) { this.#markViewerClose(session, client, "gateway_closed"); client.end(); }
+        session.pendingClients.clear();
+        if (session.stop || session.owned) await this.#stopOwnedSource(serial, session).catch(() => undefined);
+      }),
+    );
+  }
+
+  #removeClient(serial: string, response: VideoViewerResponse): void {
+    const session = this.#session(serial);
+    session.clients.delete(response);
+    session.pendingClients.delete(response);
+    session.yieldingClients.delete(response);
+    session.heldClients.delete(response);
+    session.hlsClients.delete(response);
+    this.#emitViewerClientSummary(session, response);
+    if (this.#profileClients(session, "compatible").length === 0) this.#stopViewerTranscoder(session);
+    this.#updateState(serial, session);
+    this.#scheduleStopIfUnused(serial, session);
+  }
+
+  #scheduleStopIfUnused(serial: string, session: Session): void {
+    if (this.#closed) return;
+    if (session.clients.size === 0 && session.leases === 0 && session.owned && !session.stopTimer) {
+      session.stopTimer = setTimeout(() => {
+        session.stopTimer = null;
+        void this.#stopOwnedSource(serial, session);
+      }, this.stopGraceMilliseconds);
+    }
+  }
+
+  async #stopNowIfUnused(serial: string, session: Session): Promise<void> {
+    if (session.clients.size > 0 || session.leases > 0 || !session.owned) return;
+    this.#cancelStop(session);
+    await this.#stopOwnedSource(serial, session);
+  }
+
+  /**
+   * Serialize source retirement before another viewer acquires a source. A quiet
+   * source fails its consumers only after this stop gate protects replacements.
+   */
+  async #stopOwnedSource(serial: string, session: Session, sourceError?: Error): Promise<boolean> {
+    if (session.stop) return session.stop;
+    let resolve!: (stopped: boolean) => void;
+    const stop = new Promise<boolean>(accept => { resolve = accept; });
+    session.stop = stop;
+    let stopped = false;
+    try {
+      if (sourceError) {
+        this.#sourceEnded(serial, session.generation, sourceError);
+
+        // The failed source still owns provider I/O until stop is confirmed.
+        session.owned = true;
+      }
+      this.#retireStart(session, new Error("Camera stream stopped during startup"));
+      session.state = "stopping";
+      this.#updateState(serial, session);
+      await this.controller.stopStream(serial);
+      stopped = true;
+      if (session.state === "stopping") {
+        this.#cleanupSource(session);
+        session.state = "idle";
+        session.owned = false;
+        this.#updateState(serial, session);
+      }
+    } catch (error) {
+      session.state = "error";
+      this.#updateState(serial, session, errorMessage(error));
+    } finally {
+      if (session.stop === stop) session.stop = null;
+      resolve(stopped);
+    }
+    return stop;
+  }
+
+  #cancelStop(session: Session): void {
+    if (!session.stopTimer) return;
+    clearTimeout(session.stopTimer);
+    session.stopTimer = null;
+  }
+
+  /** Admit a waiting viewer only after the old source has stopped and the request is still live. */
+  async #waitForStop(session: Session, response: VideoViewerResponse): Promise<boolean> {
+    const stopped = await session.stop;
+    if (!stopped || this.#closed) { response.destroy(); return false; }
+    return !response.destroyed && !response.writableEnded;
+  }
+
+  /** Share a pending provider start while keeping its settlement inside the owning session. */
+  async #ensureStarted(serial: string, session: Session, takeOver = false): Promise<void> {
+    if (this.#closed) throw new Error("Gateway closed before camera stream started");
+    if (session.stop) throw new Error("Camera stream is still stopping");
+    if (session.state === "error" && session.owned) throw new Error("Previous camera stream has not stopped");
+    if (session.start) return session.start.promise;
+    if (session.state !== "idle" && session.state !== "error") return;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((accept, refuse) => { resolve = accept; reject = refuse; });
+    const start: PendingSourceStart = { promise, reject };
+    session.start = start;
+    session.state = "starting";
+    session.viewerStartup = new ViewerStartupTimeline();
+    session.viewerStartupAttempt = session.generation + 1;
+    session.owned = true;
+    const failed = (error: unknown): void => {
+      if (session.start === start) {
+        session.start = null;
+        this.#failRecordings(session, error instanceof Error ? error : new Error("Camera source startup failed"));
+        this.#cleanupSource(session);
+        session.state = "error";
+        session.owned = false;
+        try { this.#updateState(serial, session, errorMessage(error)); }
+        catch (updateError) { reject(updateError); return; }
+      }
+      reject(error);
+    };
+    try {
+      this.#updateState(serial, session);
+
+      // A synchronous state observer may have retired the start before I/O.
+      if (session.start === start && !this.#closed) {
+        void Promise.resolve(this.controller.startStream(serial, takeOver)).then(() => {
+          if (session.start !== start) return;
+          session.start = null;
+          resolve();
+        }, failed).catch(reject);
+      }
+    } catch (error) { failed(error); }
+    return promise;
+  }
+
+  /** Release consumers immediately while a retired provider operation finishes its own cleanup. */
+  #retireStart(session: Session, error: Error): void {
+
+    // Private recording keeps isolation until the provider itself settles. Its
+    // abandoned-start handler owns late cleanup before allowing other consumers.
+    if (session.privateTrial) return;
+    const start = session.start;
+    session.start = null;
+    start?.reject(error);
+  }
+
+  #waitForSnapshot(
+    serial: string,
+    previousRevision: number,
+    timeoutMilliseconds: number,
+  ): { promise: Promise<SnapshotInfo>; cancel: () => void } {
+    let cleanup = () => undefined;
+    const promise = new Promise<SnapshotInfo>((resolve, reject) => {
+      const listener = (event: GatewayEvent) => {
+        if (
+          event.type === "snapshot-updated" &&
+          event.cameraSerial === serial &&
+          event.snapshot.source === "live" &&
+          event.snapshot.revision > previousRevision
+        ) {
+          cleanup();
+          resolve(event.snapshot);
+        }
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("Timed out waiting for a fresh camera frame"));
+      }, timeoutMilliseconds);
+      const closed = () => {
+        cleanup();
+        reject(new Error("Gateway closed while waiting for a fresh camera frame"));
+      };
+      cleanup = () => {
+        clearTimeout(timeout);
+        this.state.off("event", listener);
+        this.off("closed", closed);
+      };
+      this.state.on("event", listener);
+      this.once("closed", closed);
+    });
+    return { promise, cancel: cleanup };
+  }
+
+  #collectRecording(
+    session: Session,
+    durationMilliseconds: number,
+    startTimeoutMilliseconds: number,
+    maximumBytes: number,
+  ): { promise: Promise<{ video: Buffer; audio: Buffer; frameRate?: number }>; cancel: () => void } {
+    let recording!: Recording;
+    const promise = new Promise<{ video: Buffer; audio: Buffer; frameRate?: number }>((resolve, reject) => {
+      recording = {
+        chunks: [],
+        audioChunks: [],
+        audioSize: 0,
+        durationMilliseconds,
+        maximumBytes,
+        size: 0,
+        started: false,
+        firstVideoAtMilliseconds: null,
+        lastVideoAtMilliseconds: null,
+        startTimer: setTimeout(() => {
+          this.#settleRecording(session, recording, new Error("Timed out waiting for camera video"));
+        }, startTimeoutMilliseconds),
+        durationTimer: null,
+        resolve,
+        reject,
+      };
+      session.recordings.add(recording);
+    });
+    return {
+      promise,
+      cancel: () => this.#cancelRecording(session, recording!),
+    };
+  }
+
+  #appendRecordingChunk(session: Session, recording: Recording, chunk: Buffer): void {
+    if (recording.size + recording.audioSize + chunk.length > recording.maximumBytes) {
+      this.#settleRecording(session, recording, new Error(recording.maximumBytes === MAX_RECORDING_BYTES
+        ? "Recording exceeded the 256 MB safety limit" : "Recording exceeded its byte limit"));
+      return;
+    }
+    const arrival = this.nowMilliseconds();
+    if (!recording.started) {
+      recording.started = true;
+      recording.firstVideoAtMilliseconds = arrival;
+      clearTimeout(recording.startTimer);
+      recording.durationTimer = setTimeout(
+        () => this.#settleRecording(session, recording),
+        recording.durationMilliseconds,
+      );
+    }
+    recording.lastVideoAtMilliseconds = arrival;
+    recording.chunks.push(Buffer.from(chunk));
+    recording.size += chunk.length;
+  }
+
+  #settleRecording(session: Session, recording: Recording, error?: Error): void {
+    if (!session.recordings.delete(recording)) return;
+    clearTimeout(recording.startTimer);
+    if (recording.durationTimer) clearTimeout(recording.durationTimer);
+    if (error) recording.reject(error);
+    else {
+      const elapsed = recording.firstVideoAtMilliseconds === null || recording.lastVideoAtMilliseconds === null
+        ? 0 : recording.lastVideoAtMilliseconds - recording.firstVideoAtMilliseconds;
+
+      // Short or burst-only captures do not establish a trustworthy arrival rate.
+      const frameRate = elapsed >= 500 && recording.chunks.length >= 10
+        ? (recording.chunks.length - 1) * 1000 / elapsed : undefined;
+      recording.resolve({
+        video: Buffer.concat(recording.chunks, recording.size),
+        audio: Buffer.concat(recording.audioChunks, recording.audioSize),
+        ...(frameRate !== undefined && frameRate >= 1 && frameRate <= 60 ? { frameRate } : {}),
+      });
+    }
+  }
+
+  #cancelRecording(session: Session, recording: Recording): void {
+    if (!session.recordings.delete(recording)) return;
+    clearTimeout(recording.startTimer);
+    if (recording.durationTimer) clearTimeout(recording.durationTimer);
+  }
+
+  #failRecordings(session: Session, error: Error): void {
+    for (const recording of [...session.recordings]) this.#settleRecording(session, recording, error);
+  }
+
+  #sourceEnded(serial: string, generation: number, error?: Error): void {
+    const session = this.#session(serial);
+    if (session.generation !== generation) return;
+    if (session.state === "idle") return;
+    this.#cancelStop(session);
+    this.#retireStart(session, error ?? new Error("Camera video ended during startup"));
+    this.#failRecordings(session, error ?? new Error("Camera video ended before the recording completed"));
+    this.#cleanupSource(session);
+    session.state = error ? "error" : "idle";
+    session.owned = false;
+    for (const client of session.clients) { this.#markViewerClose(session, client, error ? "source_error" : "source_ended"); client.end(); }
+    session.clients.clear();
+    session.yieldingClients.clear();
+    session.heldClients.clear();
+    session.hlsClients.clear();
+    session.pendingClients.clear();
+    this.#updateState(serial, session, error?.message ?? null);
+  }
+
+  #startClient(session: Session, response: VideoViewerResponse, codec: VideoCodec, bootstrap: Buffer, randomAccessQueued = false): void {
+    if (!response.headersSent) {
+      response.writeHead(200, {
+        "Content-Type": codec === "h265" ? "video/h265" : "video/h264",
+        "Cache-Control": "no-store",
+        Connection: "keep-alive",
+      });
+    }
+    session.viewerClientStarts += 1;
+    const delivery = session.clientDeliveries.get(response);
+    if (delivery) { delivery.deliveryStarted = true; delivery.startedCodec = codec; }
+    const accepted = response.write(bootstrap);
+    this.#recordViewerClientWrite(session, response, bootstrap.length, accepted, randomAccessQueued);
+  }
+
+  #profileClients(session: Session, profile: ViewerProfile): VideoViewerResponse[] {
+    return [...session.clients].filter(client => session.clientDeliveries.get(client)?.profile === profile);
+  }
+
+  #startPendingClients(session: Session, codec: VideoCodec, startup: Buffer, profile?: ViewerProfile, randomAccessQueued = false): void {
+    for (const client of [...session.pendingClients]) {
+      if (profile && session.clientDeliveries.get(client)?.profile !== profile) continue;
+      if (session.clients.has(client)) this.#startClient(session, client, codec, startup, randomAccessQueued);
+      session.pendingClients.delete(client);
+    }
+  }
+
+  #failCompatibleClients(serial: string, session: Session, error: Error): void {
+    for (const client of this.#profileClients(session, "compatible")) {
+      this.#markViewerClose(session, client, "conversion_failed");
+      client.destroy(error);
+      this.#removeClient(serial, client);
+    }
+    this.#updateState(serial, session, session.clients.size ? null : error.message);
+  }
+
+  #writeViewerChunk(session: Session, chunk: Buffer, profile?: ViewerProfile): void {
+    let delivered = false;
+    for (const client of session.clients) {
+      if (profile && session.clientDeliveries.get(client)?.profile !== profile) continue;
+      if (session.pendingClients.has(client)) continue;
+      delivered = true;
+      session.viewerClientWrites += 1;
+      const accepted = client.write(chunk);
+      const converted = session.clientDeliveries.get(client)?.profile === "compatible" && session.parameterSets.codec === "h265";
+      this.#recordViewerClientWrite(session, client, chunk.length, accepted,
+        (converted ? session.viewerParameterSets : session.parameterSets).startupIncludesLatest);
+      if (!accepted) session.viewerClientBackpressureEvents += 1;
+      session.viewerMaximumClientWritableBytes = Math.max(
+        session.viewerMaximumClientWritableBytes,
+        client.writableLength,
+      );
+      if (client.writableLength > 4 * 1024 * 1024) {
+        this.#markViewerClose(session, client, "backpressure");
+        client.destroy(new Error("Live stream client exceeded the four-megabyte backpressure limit"));
+      }
+    }
+    if (delivered) {
+      session.viewerDeliveryBytes += chunk.length;
+      session.viewerDeliveryChunks += 1;
+      session.viewerDeliveryCadence.record();
+    }
+  }
+
+  #startViewerTranscoder(
+    serial: string,
+    session: Session,
+    startup: Buffer,
+    preserveSummary = false,
+  ): void {
+    const generation = session.generation;
+    session.viewerStartup.conversionStarted();
+    const process = this.createViewerTranscoder();
+    session.viewerFfmpeg = process;
+    session.viewerInput = preserveSummary && session.viewerInput
+      ? session.viewerInput.attach(process.stdin)
+      : new MediaInputBound(process.stdin, "h265", this.nowMilliseconds);
+    session.viewerParameterSets = new VideoParameterSetCache();
+    if (!preserveSummary) {
+      session.viewerInputBytes = 0;
+      session.viewerOutputBytes = 0;
+      session.viewerOutputChunks = 0;
+      session.viewerInputCadence = new StreamCadenceTracker();
+      session.viewerOutputCadence = new StreamCadenceTracker();
+      session.viewerClientBackpressureEvents = 0;
+      session.viewerMaximumClientWritableBytes = 0;
+      session.viewerTranscoderSilentRestarts = 0;
+    }
+    session.viewerTranscoderStartedAtMilliseconds = this.nowMilliseconds();
+    session.viewerTranscoderStartedAtRandomAccessPicture = session.parameterSets.diagnostics.randomAccessPictures;
+    session.viewerTranscoderLastOutputAtMilliseconds = null;
+    session.viewerTranscoderLastOutputRandomAccessPicture = session.viewerTranscoderStartedAtRandomAccessPicture;
+    process.stdout.on("data", (chunk: Buffer) => {
+      if (session.generation !== generation || session.viewerFfmpeg !== process) return;
+      session.viewerTranscoderLastOutputAtMilliseconds = this.nowMilliseconds();
+      session.viewerTranscoderLastOutputRandomAccessPicture = session.parameterSets.diagnostics.randomAccessPictures;
+      if (chunk.length > 0) session.viewerStartup.conversionOutput();
+      session.viewerOutputBytes += chunk.length;
+      session.viewerOutputChunks += 1;
+      session.viewerOutputCadence.record();
+      session.viewerParameterSets.push(chunk, "h264");
+      const bootstrap = session.viewerParameterSets.bootstrap;
+      if (bootstrap && session.viewerParameterSets.diagnostics.randomAccessPictures > 0) session.viewerStartup.conversionRandomAccess();
+      if (bootstrap) {
+        this.#startPendingClients(session, "h264", bootstrap, "compatible");
+      }
+      this.#writeViewerChunk(session, chunk, "compatible");
+    });
+    process.stderr.on("data", (chunk: Buffer) => {
+      this.emit("ffmpeg-error", `pipeline=viewer ${chunk.toString("utf8").trim()}`);
+    });
+    process.stdin.on("error", (error) => {
+      if (session.generation === generation) this.emit("warning", error);
+    });
+    process.once("error", (error) => {
+      if (session.generation !== generation || session.viewerFfmpeg !== process) return;
+      session.viewerFfmpeg = null;
+      this.#failCompatibleClients(serial, session, error);
+    });
+    process.once("close", (code) => {
+      if (session.generation !== generation || session.viewerFfmpeg !== process) return;
+      this.#emitViewerTranscoderSummary(session);
+      session.viewerFfmpeg = null;
+      const error = new Error(`H.265 viewer fallback exited with status ${code ?? "unknown"}`);
+      this.#failCompatibleClients(serial, session, error);
+    });
+    this.#writeViewerTranscoderInput(session, startup);
+  }
+
+  #shouldRestartViewerTranscoder(session: Session): boolean {
+    const lastOutput = session.viewerTranscoderLastOutputAtMilliseconds;
+    const quietSince = lastOutput ?? session.viewerTranscoderStartedAtMilliseconds;
+    const delay = lastOutput === null ? SILENT_TRANSCODER_RESTART_DELAY_MILLISECONDS
+      : STALLED_TRANSCODER_RESTART_DELAY_MILLISECONDS;
+
+    // Recovery needs a complete picture newer than the last converted output.
+    // Source silence is handled separately and never reopens the camera here.
+    return session.viewerTranscoderSilentRestarts < MAX_SILENT_TRANSCODER_RESTARTS
+      && session.parameterSets.diagnostics.randomAccessPictures > session.viewerTranscoderLastOutputRandomAccessPicture
+      && this.nowMilliseconds() - quietSince >= delay;
+  }
+
+  #restartViewerTranscoder(serial: string, session: Session, startup: Buffer): void {
+    const previous = session.viewerFfmpeg;
+    if (!previous) return;
+    session.viewerFfmpeg = null;
+    terminateMediaProcess(previous);
+    session.viewerTranscoderSilentRestarts += 1;
+    this.#startViewerTranscoder(serial, session, startup, true);
+  }
+
+  #writeViewerTranscoderInput(session: Session, chunk: Buffer, restart: Buffer | null = null): void {
+    if (!session.viewerFfmpeg || !session.viewerInput) return;
+    const written = session.viewerInput.write(chunk, restart);
+    if (written === 0) return;
+    session.viewerInputBytes += written;
+    session.viewerInputCadence.record();
+  }
+
+  #emitViewerTranscoderSummary(session: Session): void {
+    const summary: ViewerTranscoderSummary = {
+      inputBytes: session.viewerInputBytes,
+      outputBytes: session.viewerOutputBytes,
+      outputChunks: session.viewerOutputChunks,
+      bootstrapReady: session.viewerParameterSets.bootstrap !== null,
+      silentRestarts: session.viewerTranscoderSilentRestarts,
+      inputCadence: session.viewerInputCadence.summary,
+      outputCadence: session.viewerOutputCadence.summary,
+      clientBackpressureEvents: session.viewerClientBackpressureEvents,
+      maximumClientWritableBytes: session.viewerMaximumClientWritableBytes,
+      inputSkips: session.viewerInput?.skips ?? 0,
+      inputSkippedBytes: session.viewerInput?.skippedBytes ?? 0,
+      maximumInputAgeMilliseconds: session.viewerInput?.maximumAgeMilliseconds ?? 0,
+    };
+    this.emit("viewer-transcoder-stopped", summary);
+  }
+
+  #startSnapshotExtractor(serial: string, codec: VideoCodec): ChildProcessWithoutNullStreams {
+    const process = this.createSnapshotExtractor(codec);
+    const parser = new JpegParser();
+    process.stdout.on("data", (chunk: Buffer) => {
+      for (const image of parser.push(chunk)) {
+        void this.snapshots.write(serial, image, "image/jpeg", "live").then((info) => {
+          this.state.updateSnapshot(serial, info);
+        }).catch((error: unknown) => this.emit("warning", error));
+      }
+    });
+    process.stderr.on("data", (chunk: Buffer) => {
+      this.emit("ffmpeg-error", `pipeline=snapshot ${chunk.toString("utf8").trim()}`);
+    });
+    process.stdin.on("error", (error) => this.emit("warning", error));
+    process.once("error", (error) => this.emit("warning", error));
+    return process;
+  }
+
+  #cleanupSource(session: Session): void {
+    session.suppressSnapshots = false;
+    if (session.sourceQuietTimer) clearTimeout(session.sourceQuietTimer);
+    session.sourceQuietTimer = null;
+    if (session.source) {
+      for (const delivery of session.clientDeliveries.values()) this.#emitViewerStartup(session, delivery, true);
+      this.#emitViewerDeliverySummary(session);
+    }
+    session.generation += 1;
+    session.source?.removeAllListeners();
+    session.source = null;
+    session.audioSource?.removeAllListeners();
+    session.audioSource = null;
+    if (session.ffmpeg) {
+      terminateMediaProcess(session.ffmpeg);
+      session.ffmpeg = null;
+    }
+    session.snapshotInput = null;
+    this.#stopViewerTranscoder(session);
+  }
+
+  #stopViewerTranscoder(session: Session): void {
+    if (session.viewerFfmpeg) {
+      this.#emitViewerTranscoderSummary(session);
+
+      // Matching codec headers cannot identify pictures already queued inside a converter.
+      // Keep that process with its original source until termination, never lend it to another.
+      terminateMediaProcess(session.viewerFfmpeg);
+      session.viewerFfmpeg = null;
+    }
+    session.viewerInput = null;
+    session.viewerParameterSets = new VideoParameterSetCache();
+    session.viewerTranscoderSilentRestarts = 0;
+    session.viewerTranscoderStartedAtMilliseconds = 0;
+    session.viewerTranscoderStartedAtRandomAccessPicture = 0;
+    session.viewerTranscoderLastOutputAtMilliseconds = null;
+    session.viewerTranscoderLastOutputRandomAccessPicture = 0;
+  }
+
+  #emitViewerDeliverySummary(session: Session): void {
+    const summary: ViewerDeliverySummary = {
+      model: session.model,
+      sourceCodec: session.parameterSets.codec,
+      sourceBytes: session.sourceBytes,
+      sourceChunks: session.sourceChunks,
+      sourceCadence: session.sourceCadence.summary,
+      ...session.parameterSets.diagnostics,
+      viewerBytes: session.viewerDeliveryBytes,
+      viewerChunks: session.viewerDeliveryChunks,
+      viewerCadence: session.viewerDeliveryCadence.summary,
+      clientStarts: session.viewerClientStarts,
+      clientWrites: session.viewerClientWrites,
+      clientBackpressureEvents: session.viewerClientBackpressureEvents,
+      maximumClientWritableBytes: session.viewerMaximumClientWritableBytes,
+      snapshotInputSkips: session.snapshotInput?.skips ?? 0,
+      maximumSnapshotInputAgeMilliseconds: session.snapshotInput?.maximumAgeMilliseconds ?? 0,
+    };
+    this.emit("viewer-delivery-stopped", summary);
+  }
+
+  #recordViewerClientWrite(
+    session: Session,
+    response: VideoViewerResponse,
+    bytes: number,
+    accepted: boolean,
+    randomAccessQueued: boolean,
+  ): void {
+    const delivery = session.clientDeliveries.get(response);
+    if (!delivery) return;
+    const now = performance.now();
+    if (delivery.firstWriteAtMilliseconds === null) delivery.firstWriteAtMilliseconds = now;
+    delivery.attemptFirstWriteAtMilliseconds ??= now;
+    if (randomAccessQueued) delivery.randomAccessQueuedAtMilliseconds ??= now;
+    delivery.lastWriteAtMilliseconds = now;
+    delivery.deliveredBytes += bytes;
+    delivery.deliveredChunks += 1;
+    if (!accepted) delivery.backpressureEvents += 1;
+    delivery.maximumWritableBytes = Math.max(delivery.maximumWritableBytes, response.writableLength);
+    this.#emitViewerStartup(session, delivery, false);
+  }
+
+  #emitViewerStartup(session: Session, delivery: ViewerClientDelivery, closing: boolean): void {
+    if (delivery.startupReported) return;
+    const converted = delivery.profile === "compatible" && session.parameterSets.codec === "h265";
+    const ready = delivery.randomAccessQueuedAtMilliseconds !== null;
+    if (!ready && !closing) return;
+    delivery.startupReported = true;
+    const milestones = session.viewerStartup.snapshot(delivery.requestedAtMilliseconds, converted);
+    const summary: ViewerStartupSummary = {
+      ...milestones,
+      model: session.model, profile: delivery.profile,
+      sourceCodec: milestones.sourceFirstByteMilliseconds === null
+        ? null : session.parameterSets.codec,
+      sourceAttempt: session.viewerStartupAttempt, outcome: ready ? "random_access_queued" : "closed_before_random_access",
+      firstWriteMilliseconds: delivery.attemptFirstWriteAtMilliseconds === null ? null
+        : Math.round(Math.max(0, delivery.attemptFirstWriteAtMilliseconds - delivery.requestedAtMilliseconds)),
+      readyWriteMilliseconds: delivery.randomAccessQueuedAtMilliseconds === null ? null
+        : Math.round(Math.max(0, delivery.randomAccessQueuedAtMilliseconds - delivery.requestedAtMilliseconds)),
+    };
+    try { this.emit("viewer-startup-timings", summary); } catch {
+
+      // Diagnostics cannot interrupt media delivery.
+    }
+  }
+
+  /** Preserve the initiating owner before an owned end or destroy emits further events. */
+  #markViewerClose(session: Session, response: VideoViewerResponse, reason: ViewerCloseReason): void {
+    const delivery = session.clientDeliveries.get(response);
+    if (delivery) delivery.closeReason ??= reason;
+  }
+
+  #emitViewerClientSummary(session: Session, response: VideoViewerResponse): void {
+    const delivery = session.clientDeliveries.get(response);
+    if (!delivery) return;
+    this.#emitViewerStartup(session, delivery, true);
+    session.clientDeliveries.delete(response);
+    const now = performance.now();
+    const summary: ViewerClientSummary = {
+      closeReason: delivery.closeReason ?? "consumer_closed",
+      sourceAttached: delivery.sourceAttached,
+      profile: delivery.profile,
+      model: session.model,
+      sourceCodec: session.parameterSets.codec,
+      sourceActive: session.source !== null,
+      deliveryStarted: delivery.deliveryStarted,
+      durationMilliseconds: Math.round(Math.max(0, now - delivery.requestedAtMilliseconds)),
+      firstByteDelayMilliseconds: delivery.firstWriteAtMilliseconds === null
+        ? null
+        : Math.round(Math.max(0, delivery.firstWriteAtMilliseconds - delivery.requestedAtMilliseconds)),
+      lastByteAgeMilliseconds: delivery.lastWriteAtMilliseconds === null
+        ? null
+        : Math.round(Math.max(0, now - delivery.lastWriteAtMilliseconds)),
+      deliveredBytes: delivery.deliveredBytes,
+      deliveredChunks: delivery.deliveredChunks,
+      backpressureEvents: delivery.backpressureEvents,
+      maximumWritableBytes: delivery.maximumWritableBytes,
+      sourceBytes: session.sourceBytes,
+      sourceChunks: session.sourceChunks,
+    };
+    this.emit("viewer-client-stopped", summary);
+  }
+
+  #assertShareable(session: Session): void {
+    if (session.privateTrial || session.suppressSnapshots && session.source !== null) throw new Error("Wait for the private video test to finish");
+  }
+
+  #session(serial: string): Session {
+    let session = this.#sessions.get(serial);
+    if (!session) {
+      session = {
+        clients: new Set(),
+        pendingClients: new Set(),
+        clientDeliveries: new Map(),
+        viewerStartup: new ViewerStartupTimeline(),
+        viewerStartupAttempt: 0,
+        recordings: new Set(),
+        yieldingClients: new Map(),
+        heldClients: new Map(),
+        hlsClients: new Set(),
+        audioConsumers: new Set(),
+        parameterSets: new VideoParameterSetCache(),
+        state: "idle",
+        start: null,
+        stop: null,
+        source: null,
+        audioSource: null,
+        ffmpeg: null,
+        viewerFfmpeg: null,
+        snapshotInput: null,
+        viewerInput: null,
+        viewerParameterSets: new VideoParameterSetCache(),
+        viewerInputBytes: 0,
+        viewerOutputBytes: 0,
+        viewerOutputChunks: 0,
+        viewerInputCadence: new StreamCadenceTracker(),
+        viewerOutputCadence: new StreamCadenceTracker(),
+        viewerClientBackpressureEvents: 0,
+        viewerMaximumClientWritableBytes: 0,
+        viewerTranscoderSilentRestarts: 0,
+        viewerTranscoderStartedAtMilliseconds: 0,
+        viewerTranscoderStartedAtRandomAccessPicture: 0,
+        viewerTranscoderLastOutputAtMilliseconds: null,
+        viewerTranscoderLastOutputRandomAccessPicture: 0,
+        sourceBytes: 0,
+        sourceChunks: 0,
+        sourceCadence: new StreamCadenceTracker(),
+        viewerDeliveryBytes: 0,
+        viewerDeliveryChunks: 0,
+        viewerDeliveryCadence: new StreamCadenceTracker(),
+        viewerClientStarts: 0,
+        viewerClientWrites: 0,
+        model: "unknown",
+        stopTimer: null,
+        sourceQuietTimer: null,
+        owned: false,
+        leases: 0,
+        privateTrial: false,
+        suppressSnapshots: false,
+        generation: 0,
+      };
+      this.#sessions.set(serial, session);
+    }
+    return session;
+  }
+
+  #updateState(serial: string, session: Session, error: string | null = null): void {
+    this.state.updateStream(serial, session.state, session.clients.size, error);
+  }
+}
+
+/**
+ * Longest hold of a transport viewer's video for its first AAC. A viewer whose
+ * audio arrives sooner starts at once; one whose audio does not arrive starts muted.
+ * Direct S220 receive-audio viewers allow the same finite window as the delayed
+ * HomeBase route, avoiding an irreversible video-only choice on a cold source.
+ * HomeBase 3 can deliver SoloCam AAC about eight seconds after its first video.
+ */
+export function liveAudioStartWaitMilliseconds(camera: Pick<CameraState, "model" | "serial" | "stationSerial">): number {
+  const delayedHomeBase = camera.model === "T8171" && camera.stationSerial !== camera.serial;
+  const directS220 = camera.model === "T8134" && camera.stationSerial === camera.serial;
+  return delayedHomeBase || directS220 ? 12_000 : 2_000;
+}
+
+/**
+ * Stop an FFmpeg media child and force termination if graceful shutdown stalls.
+ *
+ * The owner drops its process reference immediately after this call, so this
+ * helper retains the close listener and escalation timer until the child is
+ * reaped. Unread input is discarded because this is an intentional stop or
+ * abort. Successful recording remuxes use their own normal EOF path. The grace
+ * override exists for focused lifecycle tests.
+ */
+export function terminateMediaProcess(
+  process: Pick<ChildProcess, "kill" | "exitCode" | "signalCode" | "once"> & { stdin?: Pick<Writable, "destroy"> | null },
+  forceAfterMilliseconds = MEDIA_PROCESS_TERMINATION_GRACE_MILLISECONDS,
+): void {
+
+  // FFmpeg stops reading at SIGTERM, so input it has not taken yet is never delivered. Ending stdin
+  // would keep those writes pending until the child exits and then fail them with EPIPE.
+  process.stdin?.destroy();
+  if (process.exitCode !== null || process.signalCode !== null) return;
+  let forceTimer: NodeJS.Timeout | null = null;
+  const closed = () => {
+    if (forceTimer) clearTimeout(forceTimer);
+  };
+  process.once("close", closed);
+  process.kill("SIGTERM");
+  forceTimer = setTimeout(() => {
+    if (process.exitCode === null && process.signalCode === null) process.kill("SIGKILL");
+  }, forceAfterMilliseconds);
+  forceTimer.unref?.();
+}
+
+/**
+ * Bound H.265 browser conversion to 3 Mbit/s with a half-second encoder buffer.
+ *
+ * The normal conversion keeps the source's size and every picture. The
+ * low-CPU profile is for hosts that cannot keep up with that. On a Home
+ * Assistant Green (four Cortex-A55 cores), a recorded 1080p, 15 fps S350 stream
+ * took about 1.2 cores to decode and 2.1 to encode at full size, so with the
+ * snapshot extractor and the gateway beside it the conversion fell behind.
+ * Encoding every second picture at no more than 720 lines took about 0.7.
+ * Decoding still takes every picture, because each one refers to the last.
+ */
+export function h265ViewerTranscoderArguments(fixedResolution = false, lowCpu = false): string[] {
+  const filters = [
+
+    // Every second picture by count, since raw input carries no timestamps, and every source keyframe
+    // so the forced keyframe below still has one to follow.
+    ...(lowCpu ? ["select='key+not(mod(n,2))'"] : []),
+
+    // The low-CPU profile does not enlarge a picture already 720 lines or fewer.
+    ...(fixedResolution
+      ? ["scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"]
+      : lowCpu ? ["scale=-2:'min(720,ih)'"] : []),
+  ];
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+
+    // The manager supplies a complete HEVC startup sequence. A one-microsecond
+    // analysis limit avoids FFmpeg's automatic multi-second probe without
+    // dropping the buffered keyframe or changing input cadence.
+    "-probesize",
+    "2048",
+    "-analyzeduration",
+    "1",
+    "-fpsprobesize",
+    "0",
+    "-f",
+    "hevc",
+    "-i",
+    "pipe:0",
+    "-an",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-tune",
+    "zerolatency",
+    "-pix_fmt",
+    "yuv420p",
+    "-crf",
+    "26",
+    "-maxrate",
+    "3M",
+    "-bufsize",
+    "1.5M",
+    ...(filters.length > 0 ? ["-vf", filters.join(",")] : []),
+
+    // Keep the gaps the selection leaves rather than repeat pictures to fill them.
+    ...(lowCpu ? ["-fps_mode", "passthrough"] : []),
+    "-x264-params",
+
+    // A viewer starts on a keyframe, and a WebRTC viewer connects just after the
+    // first one has gone. Half-second spacing is the most it should have to wait,
+    // which is five pictures when only every second one is kept.
+    `repeat-headers=1:keyint=${lowCpu ? 5 : 10}`,
+
+    // A conversion that carries on with another camera starts that camera on a keyframe too.
+    "-force_key_frames",
+    "source",
+    "-forced-idr",
+    "1",
+    "-f",
+    "h264",
+    "pipe:1",
+  ];
+}
+
+/** Start the shared low-latency fallback used only when a camera returns H.265. */
+export function spawnH265ViewerTranscoder(fixedResolution = false, lowCpu = false): ChildProcessWithoutNullStreams {
+  return yieldToGateway(spawn("ffmpeg", h265ViewerTranscoderArguments(fixedResolution, lowCpu)));
+}
+
+/**
+ * Conversion can fill every core of a small host, and live video reaches the
+ * gateway through JavaScript on one thread. Keep that thread ahead of FFmpeg.
+ */
+function yieldToGateway(child: ChildProcessWithoutNullStreams): ChildProcessWithoutNullStreams {
+  try { if (child.pid !== undefined) setPriority(child.pid, 10); }
+  catch { /* Priority is best effort: the child may already have exited. */ }
+  return child;
+}
+
+/**
+ * Arguments for the JPEG extractor that retains a fresh image from the shared camera source.
+ *
+ * H.265 decodes only keyframes, one JPEG each. Decoding every picture to keep
+ * one in two seconds took more than a core of a Green, beside the conversion.
+ * A viewer joining an H.265 source already waits for a keyframe, so these
+ * arrive often enough. One thread, so a keyframe is not held back behind
+ * later pictures, and the conversion's short probe, so the first one is not
+ * either. H.264 is unchanged: it decodes far more cheaply, and a camera using
+ * intra refresh would send no keyframes at all.
+ */
+export function snapshotExtractorArguments(codec: VideoCodec): string[] {
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    ...(codec === "h265" ? [
+      "-probesize",
+      "2048",
+      "-analyzeduration",
+      "1",
+      "-fpsprobesize",
+      "0",
+      "-threads",
+      "1",
+      "-skip_frame",
+      "nokey",
+    ] : []),
+    "-f",
+    codec === "h265" ? "hevc" : "h264",
+    "-i",
+    "pipe:0",
+    ...(codec === "h265" ? ["-fps_mode", "passthrough"] : ["-vf", "fps=1/2"]),
+    "-f",
+    "image2pipe",
+    "-vcodec",
+    "mjpeg",
+    "pipe:1",
+  ];
+}
+
+function spawnSnapshotExtractor(codec: VideoCodec): ChildProcessWithoutNullStreams {
+  return yieldToGateway(spawn("ffmpeg", snapshotExtractorArguments(codec)));
+}
+
+/** Remux checked elementary streams, optionally retaining recorded frame timing. Aborting terminates the owned FFmpeg process. */
+export async function remuxVideoToMp4(video: Buffer, codec: VideoCodec, audio?: Buffer, signal?: AbortSignal, frameRate?: number): Promise<Buffer> {
+  if (frameRate !== undefined && (!Number.isFinite(frameRate) || frameRate < 1 || frameRate > 60)) throw new Error("Invalid recorded frame rate");
+  if (signal?.aborted) throw mediaAbortError();
+  return await new Promise<Buffer>((resolve, reject) => {
+    const process = spawn("ffmpeg", [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-fflags",
+      "+genpts",
+      "-f",
+      codec === "h265" ? "hevc" : "h264",
+      ...(frameRate === undefined ? [] : ["-r", `${frameRate}`]),
+      "-i",
+      "pipe:0",
+      ...(audio?.length ? ["-f", "aac", "-i", "pipe:3", "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy", "-bsf:a", "aac_adtstoasc"] : []),
+      "-c:v",
+      "copy",
+      "-movflags",
+      "frag_keyframe+empty_moov+default_base_moof",
+      "-f",
+      "mp4",
+      "pipe:1",
+    ], { stdio: ["pipe", "pipe", "pipe", "pipe"] });
+    const output: Buffer[] = [];
+    let stderr = "";
+    let settled = false, aborting = false;
+    let backstop: NodeJS.Timeout | undefined;
+    const cleanup = (): void => { clearTimeout(timeout); if (backstop) clearTimeout(backstop); signal?.removeEventListener("abort", abort); };
+    const finishAbort = (): void => { if (settled) return; settled = true; cleanup(); reject(mediaAbortError()); };
+    const abort = (): void => {
+      if (settled || aborting) return;
+      aborting = true; clearTimeout(timeout); signal?.removeEventListener("abort", abort);
+      terminateMediaProcess(process);
+      backstop = setTimeout(finishAbort, 3000);
+    };
+    const timeout = setTimeout(() => {
+      if (settled || aborting) return;
+      settled = true; cleanup();
+      process.kill("SIGKILL");
+      reject(new Error("Timed out while packaging the camera recording"));
+    }, 30_000);
+    process.stdout!.on("data", (chunk: Buffer) => output.push(Buffer.from(chunk)));
+    process.stderr!.on("data", (chunk: Buffer) => {
+      if (stderr.length < 8_192) stderr += chunk.toString("utf8");
+    });
+    process.once("error", (error) => {
+      if (aborting) return;
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
+    process.once("close", (code) => {
+      if (aborting) { finishAbort(); return; }
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const data = Buffer.concat(output);
+      if (code === 0 && data.length > 0) resolve(data);
+      else reject(new Error(stderr.trim() || `FFmpeg exited with status ${code ?? "unknown"}`));
+    });
+    process.stdin!.on("error", () => undefined);
+    const audioPipe = process.stdio[3] as Writable;
+    audioPipe.on("error", () => undefined);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    process.stdin!.end(video);
+    audioPipe.end(audio ?? Buffer.alloc(0));
+  });
+}
+
+/** Preserve the public H.264 remux helper used by existing callers and tests. */
+export async function remuxH264ToMp4(h264: Buffer): Promise<Buffer> {
+  return await remuxVideoToMp4(h264, "h264");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown stream error";
+}
+
+/** Keep private cancellation independent of caller-supplied reasons and process output. */
+function mediaAbortError(): Error & { code: string } {
+  return Object.assign(new Error("Media operation cancelled"), { name: "AbortError", code: "ABORT_ERR" });
+}

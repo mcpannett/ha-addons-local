@@ -1,0 +1,366 @@
+/**
+ * Provides a deterministic implementation of the provider boundary.
+ *
+ * The simulated provider owns no cloud credentials and performs no Eufy
+ * network calls. It creates a known camera, emits repeatable JPEG/H.264 test
+ * bytes, and can trigger detection events through the development endpoint.
+ * This keeps HTTP, SSE, snapshot, and Home Assistant integration work
+ * reproducible when Mega is unavailable or a physical camera is asleep.
+ */
+import { Readable } from "node:stream";
+
+import type { CameraIdentity, HomeBaseState } from "../domain/types.js";
+import { describeCameraCapabilities, describeDeviceCapabilities } from "./device-capabilities-core.js";
+import type { CameraProvider, ProviderEvents } from "./provider.js";
+
+
+const stationSerial = "SIMULATED-HOMEBASE-3";
+
+function simulatedStation(overrides: Partial<HomeBaseState> = {}): HomeBaseState {
+  return {
+    serial: stationSerial,
+    name: "Simulated HomeBase 3",
+    model: "T8030",
+    firmware: "3.8.6.0",
+    available: true,
+    cameraRouteReady: true,
+    controlsSupported: true,
+    guardModeControlSupported: true,
+    stateReadSupported: true,
+    homeBaseSirenControlSupported: true,
+    connected: true,
+    guardMode: 63,
+    guardModeNames: { 3: "Simulated custom mode" },
+    effectiveMode: 63,
+    alarmActive: false,
+    alarmVolume: 20,
+    promptVolume: 12,
+    alarmTone: 1,
+    storageSupported: ["emmc", "hdd"],
+    storage: {
+      sd: null,
+      emmc: { status: "healthy", totalBytes: 16_000_000_000, freeBytes: 12_000_000_000 },
+      hdd: null,
+    },
+    ...overrides,
+  };
+}
+
+/**
+ * Supplies deterministic camera observations for tests and local API checks.
+ * It follows the same callback contract as EufyProvider, so the server and
+ * state layers can be exercised without changing their production code.
+ */
+export class SimulatedProvider implements CameraProvider {
+  static readonly serial = "SIMULATED-CAMERA-1";
+  #events: ProviderEvents | null = null;
+  #station = simulatedStation();
+
+  async start(events: ProviderEvents): Promise<void> {
+    this.#events = events;
+    events.camera({
+      serial: SimulatedProvider.serial,
+      name: "Simulated driveway",
+      model: "T8142-compatible simulator",
+      stationSerial: "SIMULATED-HOMEBASE-3",
+      streamSupported: true,
+      doorbellSupported: false,
+      enabled: true,
+      enableControlSupported: true,
+      motionDetectionEnabled: true,
+      motionDetectionControlSupported: true,
+      nightVisionMode: 1,
+      nightVisionModes: [{ value: 0, name: "Off" }, { value: 1, name: "Infrared" }, { value: 2, name: "Spotlight" }],
+      nightVisionControlSupported: true,
+      autoNightVisionEnabled: null,
+      autoNightVisionControlSupported: false,
+      timedLightControlSupported: true,
+      cameraSirenControlSupported: true,
+      presetPositionControlSupported: false,
+      aiTrackingControlSupported: false,
+      autoCruiseControlSupported: false,
+      battery: {
+        supported: ["level", "charging", "health", "temperature", "lastChargingDays"],
+        level: 82,
+        charging: false,
+        health: 96,
+        temperature: 24,
+        lastChargingDays: 12,
+      },
+    });
+    events.sensor({
+      serial: "SIMULATED-ENTRY-SENSOR-1",
+      name: "Simulated side gate",
+      model: "T8900-compatible simulator",
+      deviceType: 2,
+      available: true,
+      capabilities: ["battery", "contact", "lastSeen"],
+      batteryLevel: 74,
+      contactOpen: false,
+      lastSeen: new Date().toISOString(),
+      motionDetected: false,
+      rssi: null,
+    });
+    events.station(this.#station);
+    events.inventory([{
+      serial: SimulatedProvider.serial,
+      name: "Simulated driveway",
+      model: "T8142-compatible simulator",
+      sources: ["simulated"],
+      upstreamIsCamera: true,
+      acceptedAsCamera: true,
+      megaDeviceType: 8,
+      category: "eufy_security",
+      cameraSwitch1035: "missing",
+    }]);
+    events.cameraCapabilities([describeCameraCapabilities({
+      serial: SimulatedProvider.serial,
+      model: "T8142-compatible simulator",
+      category: "eufy_security",
+      deviceType: 8,
+      paramTypes: [1101, 6043, 6044],
+    }, { doorbellSupported: false, streamSupported: true, routeReady: true, homeBaseAttached: true })]);
+    events.deviceCapabilities(describeDeviceCapabilities({
+      serial: stationSerial,
+      model: "T8030",
+      category: "eufy_security",
+      deviceType: 18,
+      paramTypes: [],
+    }, { homeBaseSupported: true, homeBaseGuardModeSupported: true, homeBaseRouteReady: true, doorbellSupported: false, cameraStreamSupported: false }));
+    events.eventReceiverState("connected");
+    events.connection("connected", "simulated provider");
+  }
+
+  async startStream(serial: string): Promise<void> {
+    this.#assertSerial(serial);
+    this.#events?.streamStarted(serial, Readable.from([]), () => "h264");
+  }
+
+  async stopStream(serial: string): Promise<void> {
+    this.#assertSerial(serial);
+    this.#events?.streamStopped(serial);
+  }
+
+  /** Apply deterministic enablement state for HTTP and Home Assistant tests. */
+  async setCameraEnabled(serial: string, enabled: boolean): Promise<CameraIdentity> {
+    this.#assertSerial(serial);
+    const identity = {
+      serial: SimulatedProvider.serial,
+      name: "Simulated driveway",
+      model: "T8142-compatible simulator",
+      stationSerial: stationSerial,
+      streamSupported: true,
+      doorbellSupported: false,
+      enabled,
+      enableControlSupported: true,
+      nightVisionMode: 1,
+      nightVisionModes: [{ value: 0, name: "Off" }, { value: 1, name: "Infrared" }, { value: 2, name: "Spotlight" }] as const,
+      nightVisionControlSupported: true,
+      autoNightVisionEnabled: null,
+      autoNightVisionControlSupported: false,
+      timedLightControlSupported: true,
+      cameraSirenControlSupported: true,
+      battery: {
+        supported: ["level", "charging", "health", "temperature", "lastChargingDays"] as const,
+        level: 82,
+        charging: false,
+        health: 96,
+        temperature: 24,
+        lastChargingDays: 12,
+      },
+    };
+    this.#events?.camera(identity);
+    return identity;
+  }
+
+  /** Apply deterministic motion-detection state for API and HA tests. */
+  async setCameraMotionDetection(serial: string, enabled: boolean): Promise<CameraIdentity> {
+    this.#assertSerial(serial);
+    const identity = {
+      serial: SimulatedProvider.serial,
+      name: "Simulated driveway",
+      model: "T8142-compatible simulator",
+      stationSerial: stationSerial,
+      streamSupported: true,
+      doorbellSupported: false,
+      enabled: true,
+      enableControlSupported: true,
+      motionDetectionEnabled: enabled,
+      motionDetectionControlSupported: true,
+      nightVisionMode: 1,
+      nightVisionModes: [{ value: 0, name: "Off" }, { value: 1, name: "Infrared" }, { value: 2, name: "Spotlight" }] as const,
+      nightVisionControlSupported: true,
+      autoNightVisionEnabled: null,
+      autoNightVisionControlSupported: false,
+      timedLightControlSupported: true,
+      cameraSirenControlSupported: true,
+    };
+    this.#events?.camera(identity);
+    return identity;
+  }
+
+  /** Apply deterministic standalone guard-mode state for API tests. */
+  async setCameraGuardMode(serial: string, mode: number): Promise<CameraIdentity> {
+    this.#assertSerial(serial);
+    const identity: CameraIdentity = {
+      serial: SimulatedProvider.serial,
+      name: "Simulated driveway",
+      model: "T8170",
+      stationSerial: SimulatedProvider.serial,
+      streamSupported: true,
+      doorbellSupported: false,
+      guardMode: mode,
+      guardModeControlSupported: true,
+    };
+    this.#events?.camera(identity);
+    return identity;
+  }
+
+  /** Return deterministic direct-camera capability state for API tests. */
+  async refreshCameraCapabilities(serial: string): Promise<CameraIdentity> {
+    this.#assertSerial(serial);
+    return this.setCameraGuardMode(serial, 1);
+  }
+
+  /** Apply deterministic night-vision state for API and Home Assistant tests. */
+  async setCameraNightVision(serial: string, mode: number): Promise<CameraIdentity> {
+    if (!Number.isSafeInteger(mode) || mode < 0 || mode > 2) {
+      throw new Error("Night vision mode is invalid");
+    }
+    this.#assertSerial(serial);
+    const identity = {
+      serial: SimulatedProvider.serial,
+      name: "Simulated driveway",
+      model: "T8142-compatible simulator",
+      stationSerial,
+      streamSupported: true,
+      doorbellSupported: false,
+      enabled: true,
+      enableControlSupported: true,
+      motionDetectionEnabled: true,
+      motionDetectionControlSupported: true,
+      nightVisionMode: mode,
+      nightVisionModes: [{ value: 0, name: "Off" }, { value: 1, name: "Infrared" }, { value: 2, name: "Spotlight" }] as const,
+      nightVisionControlSupported: true,
+      autoNightVisionEnabled: null,
+      autoNightVisionControlSupported: false,
+      timedLightControlSupported: true,
+      cameraSirenControlSupported: true,
+    };
+    this.#events?.camera(identity);
+    return identity;
+  }
+
+  /** Accept a bounded siren command in the deterministic provider. */
+  async setCameraSiren(serial: string, durationSeconds: number): Promise<void> {
+    if (!Number.isSafeInteger(durationSeconds) || durationSeconds < 0 || durationSeconds > 900) {
+      throw new Error("Camera siren command is invalid");
+    }
+    this.#assertSerial(serial);
+  }
+
+  /** Return no stored PTZ positions because the fixed simulator has no pan motor. */
+  async getCameraPresetPositions(serial: string): Promise<readonly []> {
+    this.#assertSerial(serial);
+    return [];
+  }
+
+  /** Reject stored-position movement because the simulator has no pan motor. */
+  async selectCameraPresetPosition(serial: string, _index: number): Promise<void> {
+    this.#assertSerial(serial);
+    throw new Error("Simulated camera does not support preset positions");
+  }
+
+  /** Reject AI tracking because the simulator has no pan motor. */
+  async setCameraAiTracking(serial: string, _enabled: boolean): Promise<void> {
+    this.#assertSerial(serial);
+    throw new Error("Simulated camera does not support AI tracking");
+  }
+
+  /** Reject automatic cruise because the simulator has no pan motor. */
+  async setCameraAutoCruise(serial: string, _enabled: boolean): Promise<void> {
+    this.#assertSerial(serial);
+    throw new Error("Simulated camera does not support automatic cruise");
+  }
+
+  /** Accept a deterministic momentary light command for API and entity tests. */
+  async setCameraLight(serial: string, _enabled: boolean): Promise<void> {
+    this.#assertSerial(serial);
+  }
+
+  async refreshStation(serial: string): Promise<HomeBaseState> {
+    this.#assertStation(serial);
+    return structuredClone(this.#station);
+  }
+
+  async setGuardMode(serial: string, mode: number): Promise<HomeBaseState> {
+    this.#assertStation(serial);
+    this.#station = { ...this.#station, guardMode: mode, effectiveMode: mode };
+    this.#events?.station(this.#station);
+    return structuredClone(this.#station);
+  }
+
+  async setAlarmVolume(serial: string, value: number): Promise<HomeBaseState> {
+    return this.#updateStation(serial, { alarmVolume: value });
+  }
+
+  async setPromptVolume(serial: string, value: number): Promise<HomeBaseState> {
+    return this.#updateStation(serial, { promptVolume: value });
+  }
+
+  async setAlarmTone(serial: string, value: number): Promise<HomeBaseState> {
+    return this.#updateStation(serial, { alarmTone: value });
+  }
+
+  /** Record a bounded HomeBase siren command for deterministic API tests. */
+  async setHomeBaseSiren(serial: string, durationSeconds: number): Promise<HomeBaseState> {
+    if (!Number.isSafeInteger(durationSeconds) || durationSeconds < 0 || durationSeconds > 900) {
+      throw new Error("HomeBase siren duration is invalid");
+    }
+    return this.#updateStation(serial, { alarmActive: durationSeconds > 0 });
+  }
+
+  async close(): Promise<void> {
+    this.#events?.eventReceiverState("stopped");
+    this.#events?.connection("disconnected", "simulated provider stopped");
+    this.#events = null;
+  }
+
+  detectMotion(personName: string | null = null): void {
+    const events = this.#events;
+    if (!events) return;
+    events.eventDelivery("parsed");
+    events.pushDiagnostic({
+      receivedAt: new Date().toISOString(),
+      cameraSerial: SimulatedProvider.serial,
+      cameraName: "Simulated driveway",
+      type: 1,
+      eventType: personName === null ? 1 : 2,
+      messageType: 3,
+      notificationStyle: 1,
+      personName,
+      hasPersonName: personName !== null,
+      hasPictureUrl: true,
+      hasFilePath: false,
+      hasFetchId: personName !== null,
+      hasSenseId: false,
+    });
+    events.motion(SimulatedProvider.serial, true);
+    if (personName !== null) events.person(SimulatedProvider.serial, true, personName);
+  }
+
+  #assertSerial(serial: string): void {
+    if (serial !== SimulatedProvider.serial) throw new Error(`Unknown simulated camera: ${serial}`);
+  }
+
+  #assertStation(serial: string): void {
+    if (serial !== stationSerial) throw new Error(`Unknown simulated HomeBase: ${serial}`);
+  }
+
+  #updateStation(serial: string, values: Partial<HomeBaseState>): HomeBaseState {
+    this.#assertStation(serial);
+    this.#station = { ...this.#station, ...values };
+    this.#events?.station(this.#station);
+    return structuredClone(this.#station);
+  }
+}

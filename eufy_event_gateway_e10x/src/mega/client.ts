@@ -1,0 +1,1629 @@
+/**
+ * Owns the gateway's direct connection to Eufy's current Mega cloud API.
+ *
+ * This client discovers regional hosts, performs the per-host ECDH identity
+ * exchange, checks account password formats, encrypts and signs requests,
+ * handles login challenge states,
+ * persists a reusable session, retrieves inventory/DSK/cipher material,
+ * registers push, and downloads bounded HTTPS media. It returns checked values
+ * to `EufyProvider`; it deliberately knows nothing about Home Assistant entities,
+ * SSE, or the PPCS packet stream. Keeping those concerns out of this class is
+ * what makes the Mega layer reusable by a probe or another application.
+ */
+import { observeRawFetch } from "../diagnostics/raw-network.js";
+import { ParameterCheckError, projectReportedParameters, type ParameterCheckModel, type ParameterCheckSummary } from "../provider/reported-parameter-check.js";
+import { MEDIA_HOST, MEDIA_OBJECT_HOST, MediaHttpError, mediaRequestDiagnostic } from "./media-request-diagnostic.js";
+import type { NvrSignallingContext } from "../stream/nvr-rtc-session.js";
+import { NvrTrialError } from "../stream/nvr-protocol.js";
+import { discoverNvrServiceRegion } from "./nvr-service-region.js";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { parseE30MqttCredentials, type E30MqttCredentials } from "../provider/e30-lock-protocol.js";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+
+import { eventImageResponseMetadata, type EventImageResponseMetadata } from "../diagnostics/event-image-capture.js";
+import {
+  beginKeyExchange,
+  decryptEnvelope,
+  encryptEnvelope,
+  encryptPassword,
+  finishKeyExchange,
+  credentialVerifier,
+  megaUserToken,
+  EUFYLIFE_PRESET_KEY,
+  MEGA_PRESET_KEY,
+  randomIdentifier,
+  requestSignature,
+  sharedAesKey,
+  sharedSigningKey,
+} from "./crypto.js";
+import { CloudRecordingError, type CloudRecordingStage, prepareCloudRecording } from "../stream/cloud-recordings.js";
+import { selectCloudRecording, cloudRecordingUrl, cloudRecordingKey, projectCloudHistory, validateCloudHistoryQuery, type CloudHistoryQuery, type CloudHistoryRecord } from "./cloud-history.js";
+import { readBoundedResponse } from "./bounded-response.js";
+import { CloudCalendarError, cloudCalendarBounds, projectCloudCalendar, type CloudCalendarQuery, type CloudCalendarProjection } from "./cloud-calendar.js";
+import { MegaSessionStore } from "./session-store.js";
+import { captureGeneralRtcIdentity, generalRtcCipher, type GeneralRtcCipher } from "./general-rtc-identity.js";
+import { createLogger } from "../logging.js";
+import { GeneralRtcError, generalRtcSmartHost, generalRtcServiceRegion, generalRtcAwait, type GeneralRtcStage, type GeneralRtcInventoryDiagnostic, type GeneralRtcResponseClass } from "../stream/general-rtc-protocol.js";
+import type { MegaAuthResult, MegaCaptcha, MegaIdentity, MegaInventory, MegaResult, MegaSession } from "./types.js";
+
+// These codes are handled at the transport boundary so every caller gets the
+// same challenge and session-recovery behaviour.
+const CAPTCHA_REQUIRED = new Set([100032, 100033]);
+const VERIFICATION_REQUIRED = 26052;
+const TRANSIENT_IDENTITY_ERRORS = new Set([4404, 4406, 100030]);
+const AUTH_SESSION_INVALID_CODES = new Set([4404, 26084, 26884]);
+
+// The native app's login screen interprets this code as a credential rejection.
+const LOGIN_CREDENTIALS_REJECTED = 26108;
+
+// Android 6.1.10_30612 selects credential and attempt-limit resources for these
+// login codes. The resource names establish classifications, not server causes.
+const LOGIN_CREDENTIALS_REJECTED_LEGACY = 26006;
+const LOGIN_ATTEMPTS_REJECTED = 10019;
+
+/**
+ * Marks only an inventory application's temporary refusal, without response data.
+ * The client owns classification and the provider owns paced startup recovery.
+ * Permission, schema, cancellation and authentication errors never use this marker.
+ */
+class MegaInventoryUnavailableError extends Error {
+  constructor(stage: "request" | "houses" | "pages") {
+    super(`Inventory is temporarily unavailable: stage=${stage}`);
+  }
+}
+
+/**
+ * Marks a terminal login-attempt rejection without retaining request or response data.
+ * MegaClient creates this short-lived marker at response classification, and the
+ * provider consumes its identity to retire only the current sign-in form.
+ */
+class MegaLoginAttemptLimitError extends Error {
+  constructor() {
+    super("Mega request failed (10019: Eufy rejected the login, which the inspected official app version classifies as too many incorrect password attempts. Stop repeated login attempts) operation=login");
+    this.name = "MegaLoginAttemptLimitError";
+  }
+}
+
+// Android thumbnail processing retries at one, three, five and ten seconds.
+const MEDIA_NOT_READY_DELAYS_MS = [1_000, 2_000, 2_000, 5_000] as const;
+const CIPHER_IDENTITY_RECOVERY_INTERVAL_MS = 10 * 60_000;
+
+/** Internal dispatch checks, with cached-identity mode restricted to the RTC experiment. */
+interface GeneralRtcCallOptions {
+
+  /** Observe only the received HTTP status, including responses rejected before decoding. */
+  readonly onResponseStatus?: (status: number) => void;
+  readonly cachedIdentityOnly?: true;
+
+  /** Use the source-qualified web profile only for experimental portal inventory. */
+  readonly portalInventory?: true;
+  readonly onDispatch?: () => void;
+}
+
+/** Fixed operation names may cross the logging boundary without request data. */
+type MegaOperation = "login" | "account_check" | "inventory" | "lock_credentials" | "cloud_history" | "cloud_playback" | "cipher" | "dsk" | "push" | "captcha" | "general_rtc_hubs" | "general_rtc_devices" | "general_rtc_params" | "general_rtc_pin" | "general_rtc_sign" | "unknown";
+
+/** Project a known internal endpoint into a fixed, privacy-safe diagnostic label. */
+export function megaOperation(path: string): MegaOperation {
+  const operations: Readonly<Record<string, MegaOperation>> = {
+    "/app/house/get_devs_list": "inventory",
+    "/app/house/get_house_list": "inventory",
+    "/passport/login": "login",
+    "/passport/validate_email": "account_check",
+    "/app/devicemanage/get_user_mqtt_info": "lock_credentials",
+    "/v3/event/app/get_all_video_record": "cloud_history",
+    "/v3/app/cipher/get_ciphers": "cipher",
+    "/v3/web/cipher/dec_aes_keys": "cipher",
+    "/app/devicerelation/get_dsk_keys": "dsk",
+    "/app/push/register_push_token": "push",
+    "/passport/generate/captcha": "captcha",
+    "/v3/event/app/get_kvs_urls": "cloud_playback",
+    "/v3/web/get_hub_list": "general_rtc_hubs",
+    "/v3/web/get_devs_list": "general_rtc_devices",
+    "/v3/app/overall/get_params": "general_rtc_params",
+    "/v3/web/wp/verify_captcha": "general_rtc_pin",
+    "/v1/smart/ws/sign": "general_rtc_sign",
+  };
+  return Object.hasOwn(operations, path) ? operations[path]! : "unknown";
+}
+
+/**
+ * Carries an unclassified HTTP rejection without treating it as an expired login.
+ * The request caller owns any narrowly scoped read retry. This error retains
+ * only a response category and numeric application code, never the server body
+ * or account material. A numeric code does not itself authorize a retry.
+ */
+class MegaHttpRejection extends Error {
+  constructor(readonly responseKind: GeneralRtcResponseClass, readonly applicationCode?: number) {
+    super(applicationCode === undefined ? `Mega request failed (HTTP 463 response ${responseKind})`
+      : `Mega request failed (HTTP 463 code ${applicationCode})`);
+  }
+}
+
+/**
+ * Carries a bounded HTTP authentication classification without response text.
+ * MegaClient owns classification and the provider owns one-shot recovery.
+ * A refusal without an explicit rejected token must preserve the saved session.
+ */
+class MegaHttpAuthenticationRejection extends Error {
+  constructor(readonly sessionRejected: boolean, code: number | null, responseKind: "empty" | "json" | "non_json" | "unavailable", operation: MegaOperation) {
+    super(`Mega request failed (HTTP 401 response=${responseKind}${code === null ? "" : ` code=${code}`}${sessionRejected ? " session rejected" : ""}) operation=${operation}`);
+    this.name = "MegaHttpAuthenticationRejection";
+  }
+}
+
+/** Recognize token-specific clauses, excluding a different header or permission refusal. */
+function rejectedAuthToken(code: number | null, message: unknown): boolean {
+  if (code === 26084 || code === 26884) return true;
+  if (code !== 401 || typeof message !== "string") return false;
+  return /\binvalid\s+token\b|\btoken\b[^,;\r\n]{0,256}\b(?:expired|error|not exist|does not exist|kicked out)\b/i.test(message);
+}
+
+/**
+ * Acceptance of a Firebase token by Eufy's notification registration backend.
+ *
+ * The receiver owns its transport and retries. Acceptance does not prove that a
+ * later physical detection will be delivered to this account.
+ */
+export interface PushRegistrationResult {
+
+  /** Whether the notification backend accepted this token. */
+  readonly registered: boolean;
+
+  /** Numeric application result when Eufy supplied one, otherwise `null`. */
+  readonly code: number | null;
+}
+
+/** Runtime dependencies and account settings for {@link MegaClient}. */
+export interface MegaClientOptions {
+  readonly email: string;
+  readonly password: string;
+  readonly country: string;
+  readonly persistentDirectory: string;
+  readonly minimumRequestIntervalMs?: number;
+  readonly fetch?: typeof fetch;
+  readonly now?: () => number;
+  readonly wait?: (milliseconds: number) => Promise<void>;
+
+  /** Permit capture during natural login, without renewing a valid saved session. */
+  readonly experimentalGeneralRtc?: boolean;
+}
+
+/**
+ * Authenticated Mega API client used by the production Eufy provider.
+ *
+ * The client keeps one account session, caches per-host ECDH identities, and
+ * serializes requests because Mega rate-limits aggressively. Authentication
+ * challenges are represented as return states so the caller can decide how to
+ * present them, rather than embedding a browser or Home Assistant dependency
+ * in this low-level client.
+ */
+export class MegaClient {
+  readonly #email: string;
+  readonly #password: string;
+  readonly #country: string;
+  readonly #store: MegaSessionStore;
+  readonly #fetch: typeof fetch;
+  readonly #now: () => number;
+  readonly #wait: ((milliseconds: number) => Promise<void>) | undefined;
+  readonly #minimumRequestIntervalMs: number;
+  readonly #experimentalGeneralRtc: boolean;
+  #lastRequestAt = 0;
+  #connectionFlight: { readonly arguments: string; readonly promise: Promise<MegaAuthResult> } | null = null;
+  #requestTail: Promise<unknown> = Promise.resolve();
+  #requestLifetime = new AbortController();
+  readonly #identityFlights = new Map<string, Promise<MegaIdentity>>();
+  readonly #identityRecoveryFlights = new Map<string, Promise<MegaIdentity>>();
+  readonly #cipherIdentityRecoveryAt = new Map<string, number>();
+  readonly #responseIdentities = new WeakMap<MegaResult, MegaIdentity>();
+  readonly #responseOperations = new WeakMap<MegaResult, MegaOperation>();
+  #session: MegaSession | null = null;
+  #pendingCaptcha: MegaCaptcha | null = null;
+
+  constructor(options: MegaClientOptions) {
+    this.#email = options.email;
+    this.#password = options.password;
+    this.#country = options.country.toLowerCase();
+    this.#fetch = observeRawFetch(options.fetch ?? globalThis.fetch);
+    this.#now = options.now ?? Date.now;
+    this.#wait = options.wait;
+    this.#minimumRequestIntervalMs = options.minimumRequestIntervalMs ?? 3_000;
+    this.#experimentalGeneralRtc = options.experimentalGeneralRtc === true;
+    this.#store = new MegaSessionStore(join(options.persistentDirectory, "mega-session.json"));
+  }
+
+  /**
+   * Cancel queued and active cloud work when the provider shuts down.
+   * A later connect starts a new lifetime, but cancelled jobs cannot dispatch.
+   */
+  cancelPendingRequests(): void {
+    this.#requestLifetime.abort();
+    this.#identityFlights.clear();
+    this.#identityRecoveryFlights.clear();
+  }
+
+  /** Check the current authenticated user without exposing stored account identity. */
+  isAuthenticatedUser(userId: string): boolean {
+    return this.isAuthenticated && !!userId && this.#session?.userId === userId;
+  }
+
+  /** Capture an opaque account predicate without exposing credentials to its caller. */
+  authenticatedBinding(): (() => boolean) | null {
+    if (!this.isAuthenticated || !this.#session) return null;
+    const { userId, authToken, openUdid } = this.#session;
+    const cipherBinding = this.generalRtcCipher()?.bindingKey;
+    return () => this.isAuthenticated && this.#session?.userId === userId
+      && this.#session.authToken === authToken && this.#session.openUdid === openUdid
+      && this.generalRtcCipher()?.bindingKey === cipherBinding;
+  }
+
+  /** Read cached parameter candidates under the current token's server-enforced permission, without login or replay. */
+  async readReportedParameters(serial: string, model: ParameterCheckModel, signal: AbortSignal): Promise<ParameterCheckSummary> {
+    const current = this.authenticatedBinding();
+    if (!current) throw new ParameterCheckError("unauthorized");
+    try {
+      signal.throwIfAborted();
+      const result = await this.#call("devicemanage", "/app/devicemanage/get_device_param_list", { device_sns: [serial] }, false, undefined, signal, {
+        onDispatch: () => { if (!current()) throw new ParameterCheckError("binding_changed"); },
+      });
+      signal.throwIfAborted();
+      if (!current()) throw new ParameterCheckError("binding_changed");
+      if (result.code === 20004) throw new ParameterCheckError("owner_account_required");
+      if (!isSuccess(result.code)) throw new ParameterCheckError("request");
+      return projectReportedParameters(model, this.#decodeResult(result), this.#now());
+    } catch (error) {
+      if (signal.aborted) throw new ParameterCheckError("cancelled");
+      throw error instanceof ParameterCheckError ? error : new ParameterCheckError("request");
+    }
+  }
+
+  /** Return only a currently bound RTC cipher, without initiating authentication. */
+  generalRtcCipher(): GeneralRtcCipher | null {
+    if (!this.#experimentalGeneralRtc || !this.isAuthenticated || !this.#session) return null;
+    return generalRtcCipher(this.#session, this.#clusterHost("security"));
+  }
+
+  /** Read the existing account binding without authentication, renewal or network I/O. */
+  generalRtcAccount(): { userId: string; securityHost: string; smartHost: string | null; country: string; token: string; cipher: GeneralRtcCipher | null } | null {
+    if (!this.#experimentalGeneralRtc || !this.isAuthenticated || !this.#session) return null;
+    const securityHost = this.#clusterHost("security");
+    return { userId: this.#session.userId, securityHost, smartHost: generalRtcSmartHost(securityHost),
+      country: this.#country.toUpperCase(), token: this.#session.authToken, cipher: this.generalRtcCipher() };
+  }
+
+  /** Check the portal host identity without waiting for or starting an exchange. */
+  generalRtcHasNativeIdentities(): boolean {
+    return !!this.#session && !!this.#cachedNativeIdentity(this.#clusterHost("security"));
+  }
+
+  /** Fetch complete portal inventory pages with no identity recovery or suppressed failure. */
+  async generalRtcInventory(signal: AbortSignal): Promise<MegaInventory> {
+    if (!this.#experimentalGeneralRtc || !this.isAuthenticated) throw new GeneralRtcError("admission");
+    try {
+      const readPages = async (path: "/v3/web/get_hub_list" | "/v3/web/get_devs_list"): Promise<readonly unknown[]> => {
+        const rows: unknown[] = [];
+        for (let page = 0; page <= 4; page++) {
+          const data = await this.#generalRtcInventoryPage(path, page, signal);
+          rows.push(...data);
+          if (data.length < 100) return rows;
+        }
+        throw new GeneralRtcError("inventory", "shape");
+      };
+      const hubs = await readPages("/v3/web/get_hub_list");
+      const devices = await readPages("/v3/web/get_devs_list");
+      try { return projectGeneralRtcInventory(hubs, devices); }
+      catch (error) {
+        const failure = generalRtcRequestFailure(error, "inventory");
+        throw new GeneralRtcError("inventory", failure.reason, { operation: "projection", boundary: "projection" });
+      }
+    } catch (error) { throw generalRtcRequestFailure(error, "inventory"); }
+  }
+
+  /** Read one bounded portal hub page through the existing native request queue. */
+  async generalRtcHubs(page: number, signal: AbortSignal): Promise<readonly unknown[]> {
+    if (!this.#experimentalGeneralRtc || !this.isAuthenticated || !Number.isInteger(page) || page < 0 || page > 4) throw new GeneralRtcError("admission");
+    return this.#generalRtcInventoryPage("/v3/web/get_hub_list", page, signal);
+  }
+
+  async #generalRtcInventoryPage(path: "/v3/web/get_hub_list" | "/v3/web/get_devs_list", page: number,
+    signal: AbortSignal): Promise<readonly unknown[]> {
+    const serviceRegion = generalRtcServiceRegion(this.#clusterHost("security"));
+    let httpStatus: number | undefined, apiCode: number | undefined;
+    let boundary: GeneralRtcInventoryDiagnostic["boundary"] = "request";
+    try {
+      const result = await this.#call("security", path,
+        { page, num: 100, station_sn: "", device_sn: "", ...(path === "/v3/web/get_devs_list" ? { orderby: "" } : {}) }, false, undefined,
+        AbortSignal.any([signal, AbortSignal.timeout(10_000)]), {
+          cachedIdentityOnly: true, portalInventory: true, onResponseStatus: status => { httpStatus = status; },
+        });
+      boundary = "application";
+      apiCode = result.code;
+      if (result.code !== 0) throw new GeneralRtcError("inventory", TRANSIENT_IDENTITY_ERRORS.has(result.code) ? "native_identity_rejected" : "response");
+      boundary = "decode";
+      const data = this.#decodeResult(result);
+      boundary = "shape";
+      if (!Array.isArray(data) || data.length > 100) throw new GeneralRtcError("inventory", "response");
+      return data;
+    } catch (error) {
+      const failure = generalRtcRequestFailure(error, "inventory");
+      if (error instanceof MegaHttpRejection) apiCode = error.applicationCode;
+      throw new GeneralRtcError("inventory", failure.reason, {
+        operation: path === "/v3/web/get_hub_list" ? "hubs" : "devices", boundary, page, serviceRegion,
+        ...(httpStatus === undefined ? {} : { httpStatus }), ...(apiCode === undefined ? {} : { apiCode }),
+        ...(error instanceof MegaHttpRejection ? { responseClass: error.responseKind } : {}),
+      });
+    }
+  }
+
+  /** Read the portal's start-stream preflight configuration without issuing its commands. */
+  async generalRtcParams(signal: AbortSignal): Promise<readonly unknown[]> {
+    if (!this.#experimentalGeneralRtc || !this.isAuthenticated) throw new GeneralRtcError("admission");
+    try {
+      const result = await this.#call("security", "/v3/app/overall/get_params",
+        { param_name: "common.start_stream.config" }, false, undefined,
+        AbortSignal.any([signal, AbortSignal.timeout(10_000)]), { cachedIdentityOnly: true });
+      const data = this.#generalRtcResult(result, "preflight");
+      if (!Array.isArray(data)) throw new GeneralRtcError("preflight", "response");
+      return data;
+    } catch (error) { throw generalRtcRequestFailure(error, "preflight"); }
+  }
+
+  /** Send one PIN verification with no identity retry and exact dispatch accounting. */
+  async generalRtcVerifyPin(pin: string, signal: AbortSignal, onDispatch: () => void): Promise<void> {
+    if (!this.#experimentalGeneralRtc || !this.isAuthenticated || !/^[\x20-\x7e]{1,32}$/.test(pin)) throw new GeneralRtcError("admission");
+    try {
+      const result = await this.#call("security", "/v3/web/wp/verify_captcha", { captcha: pin }, false,
+        undefined, AbortSignal.any([signal, AbortSignal.timeout(10_000)]), { cachedIdentityOnly: true, onDispatch });
+      this.#generalRtcResult(result, "pin");
+    } catch (error) { throw generalRtcRequestFailure(error, "pin"); }
+  }
+
+  /** Fetch only the allowlisted smart sign with native token/country headers and no redirects. */
+  async generalRtcSign(signal: AbortSignal): Promise<string> {
+    const account = this.generalRtcAccount();
+    if (!account?.smartHost || !account.cipher) throw new GeneralRtcError("sign", "identity");
+    try {
+      const deadline = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+      return await generalRtcAwait(this.#enqueue(async lifetime => {
+        const current = this.generalRtcAccount();
+        if (!current || current.token !== account.token || current.cipher?.bindingKey !== account.cipher!.bindingKey) throw new GeneralRtcError("binding");
+        const scoped = AbortSignal.any([lifetime, deadline]);
+        scoped.throwIfAborted();
+        const response = await this.#fetch(`https://${account.smartHost}/v1/smart/ws/sign`, {
+          method: "GET", headers: { "X-Auth-Token": account.token, "Web-Country": account.country }, redirect: "error", signal: scoped,
+        });
+        if (response.status !== 200) throw new GeneralRtcError("sign", "response");
+        const value: unknown = JSON.parse((await readBoundedResponse(response, 65536, scoped)).toString("utf8"));
+        if (!isRecord(value) || value.code !== 0 || typeof value.data !== "string" || !/^[\x21-\x7e]{1,8192}$/.test(value.data)) throw new GeneralRtcError("sign", "response");
+        return value.data;
+      }), deadline, "sign");
+    } catch { throw new GeneralRtcError("sign", "response"); }
+  }
+
+  /** Return the pending image challenge, if login requested one. */
+  get captcha(): MegaCaptcha | null {
+    return this.#pendingCaptcha;
+  }
+
+  /** Return true only while the cached token has a one-minute safety margin. */
+  get isAuthenticated(): boolean {
+    return this.#session !== null && this.#session.verificationPending !== true && this.#session.authToken.length > 0 &&
+      this.#session.userId.length > 0 && this.#now() / 1_000 < this.#session.tokenExpiresAt - 60;
+  }
+
+  /**
+   * Restore or establish the account session.
+   *
+   * @returns An authentication state. Challenge states are expected and let
+   * the provider expose the right next step to the user.
+   */
+  async connect(verificationCode?: string, captchaAnswer?: string, forceLogin = false): Promise<MegaAuthResult> {
+    const argumentsKey = JSON.stringify([verificationCode, captchaAnswer, forceLogin]);
+    if (this.#connectionFlight) {
+      if (this.#connectionFlight.arguments !== argumentsKey) throw new Error("Mega authentication is already in progress");
+      return this.#connectionFlight.promise;
+    }
+    const promise = this.#connect(verificationCode, captchaAnswer, forceLogin);
+    this.#connectionFlight = { arguments: argumentsKey, promise };
+    try {
+      return await promise;
+    } finally {
+      if (this.#connectionFlight?.promise === promise) this.#connectionFlight = null;
+    }
+  }
+
+  async #connect(verificationCode?: string, captchaAnswer?: string, forceLogin = false): Promise<MegaAuthResult> {
+    if (forceLogin) this.cancelPendingRequests();
+    if (this.#requestLifetime.signal.aborted) this.#requestLifetime = new AbortController();
+    const lifetime = this.#requestLifetime.signal;
+    if (forceLogin) {
+      const previous = this.#session;
+      this.#session = null;
+      const stored = previous ?? await this.#store.load();
+      const openUdid = stored?.openUdid ?? randomIdentifier();
+      this.#session = emptySession(this.#country, openUdid, credentialVerifier(openUdid, this.#email, this.#password));
+      await this.#store.save(this.#session);
+      if (stored?.generalRtcIdentity) createLogger("mega").info("general_rtc_identity_dropped", "reason=binding");
+    }
+    if (!this.#session && !forceLogin) await this.#restore();
+    lifetime.throwIfAborted();
+    if (!forceLogin && this.#session?.verificationPending && !verificationCode && !captchaAnswer) {
+      return { state: "verification-required" };
+    }
+    if (!forceLogin && this.isAuthenticated && !captchaAnswer &&
+      (!verificationCode || this.#session?.verificationPending !== true)) {
+      if (this.#session) await this.#store.save(this.#session);
+      return { state: "authenticated" };
+    }
+
+
+    // Domain discovery and key exchange happen before login because the
+    // regional API host and its signing identity are account-specific.
+    await this.#ensureDomain();
+    lifetime.throwIfAborted();
+    const openApiHost = this.#clusterHost("openapi");
+    await this.#identity(openApiHost);
+    lifetime.throwIfAborted();
+    const passwordInput = await this.#passwordForAccount();
+    lifetime.throwIfAborted();
+    const password = encryptPassword(passwordInput, this.#experimentalGeneralRtc);
+    const result = await this.#call("passport", "/passport/login", {
+      email: this.#email,
+      password: password.encrypted,
+      ab: this.#country,
+      enc: 0,
+      time_zone: new Date(this.#now()).getTimezoneOffset() * -60_000,
+      client_secret_info: { public_key: password.clientPublicKey },
+      answer: captchaAnswer ?? "",
+      captcha_id: captchaAnswer ? this.#pendingCaptcha?.id ?? "" : "",
+      verify_code: verificationCode ?? "",
+      login_id: "",
+    });
+
+    if (CAPTCHA_REQUIRED.has(result.code)) {
+      const challenge = await this.#requestCaptcha();
+      this.#pendingCaptcha = challenge;
+      return { state: "captcha-required", captcha: challenge };
+    }
+
+    const decoded = this.#decodeResult(result);
+    if (!isRecord(decoded)) throw new Error(`Mega login failed (${result.code}: ${safeMegaMessage(result.msg)})`);
+    const authToken = stringValue(decoded.auth_token) ?? stringValue(decoded.token);
+    const userId = stringValue(decoded.user_id) ?? stringValue(decoded.userId);
+    const verificationPending = result.code === VERIFICATION_REQUIRED ||
+      isRecord(decoded.fa_info) && decoded.fa_info.step === VERIFICATION_REQUIRED;
+    if (authToken && userId) {
+      this.#setAuth(authToken, userId, numberValue(decoded.token_expires_at), verificationPending);
+    }
+
+    if (verificationPending) {
+      if (!verificationCode) await this.#call("push", "/app/sendmsg/verify_code", {
+        message_type: 2,
+        biz_type: 1004,
+        transaction: `${this.#now()}`,
+      }, false);
+      await this.#save();
+      return { state: "verification-required" };
+    }
+    if (!isSuccess(result.code) || !this.isAuthenticated) {
+      throw new Error(`Mega login failed (${result.code}: ${safeMegaMessage(result.msg)})`);
+    }
+    this.#pendingCaptcha = null;
+    if (this.#experimentalGeneralRtc && this.#session && password.scalar) {
+      const secretInfo = isRecord(decoded.server_secret_info) ? decoded.server_secret_info : null;
+      const identity = captureGeneralRtcIdentity(this.#session, this.#clusterHost("security"),
+        password.scalar, password.clientPublicKey, secretInfo?.public_key);
+      if (identity) this.#session = { ...this.#session, generalRtcIdentity: identity };
+      else createLogger("mega").info("general_rtc_identity_dropped", "reason=server_key");
+    }
+    await this.#save();
+    return { state: "authenticated" };
+  }
+
+  /**
+   * Read the account format before each actual login or challenge submission.
+   * Valid saved sessions bypass this boundary. Lookup failures stop before a
+   * password attempt, and login rejection never chooses a different format.
+   */
+  async #passwordForAccount(): Promise<string> {
+    const result = await this.#call("passport", "/passport/validate_email", { email: this.#email });
+    if (!isSuccess(result.code)) {
+      throw new Error(`Mega account format check failed (${result.code}) operation=account_check`);
+    }
+    const metadata = this.#decodeResult(result);
+    if (metadata != null && !isRecord(metadata)) {
+      throw new Error("Mega account format check returned invalid metadata operation=account_check");
+    }
+    const format = isRecord(metadata) && metadata.enc_text === "sha2" ? "sha2" : "original";
+    createLogger("mega").info("login_account_format", `format=${format}`);
+    if (format === "original") return this.#password;
+
+    // Eufy's wire protocol requires this fast digest before ECDH/AES encryption.
+    // It is never stored as a password verifier, which remains scrypt-derived.
+    // Match Java String.trim rather than removing additional Unicode whitespace.
+    const trimmed = this.#password.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "");
+    return createHash("sha256").update(trimmed, "utf8").digest("hex");
+  }
+
+  /** Fetch transient lock credentials in Security scope without another login or persistence. */
+  async e30MqttCredentials(): Promise<E30MqttCredentials> {
+    this.#requireAuthentication();
+    const session = this.#session!;
+    const result = await this.#call("devicemanage", "/app/devicemanage/get_user_mqtt_info", {}, true, "eufy_security");
+    if (this.#session?.authToken !== session.authToken || this.#session.userId !== session.userId) throw new Error("Lock credentials unavailable");
+    return parseE30MqttCredentials(this.#decodeResult(result), session.userId,
+      createHash("sha256").update(session.openUdid).digest("hex").slice(0, 16));
+  }
+
+  /**
+   * Fetch current account inventory, cancelling only this read when its caller retires.
+   * A control confirmation can omit unrelated charging history. That mode removes
+   * the house API's placeholder values and leaves charging metadata unqueried.
+   * Only cold discovery may opt into fresh partial pages, identified by
+   * complete=false. Omitted devices then establish neither removal nor permission
+   * changes, so control confirmation and normal refresh must leave allowPartial off.
+   */
+  async inventory(cancellation?: AbortSignal, options: { includeChargingDays?: boolean; allowPartial?: boolean } = {}): Promise<MegaInventory> {
+    this.#requireAuthentication();
+    const lifetime = cancellation ? AbortSignal.any([this.#requestLifetime.signal, cancellation]) : this.#requestLifetime.signal;
+    const result = await this.#call("house", "/app/house/get_devs_list", { house_id: "", device_sns: {} }, true, undefined, cancellation);
+    if (result.code === 10003 && result.msg === "Failed to request.") {
+
+      // This exact inventory refusal was observed after generic application
+      // errors. Retry the same read later without another page, login or write.
+      createLogger("mega").warn("inventory_request_unavailable", "application_code=10003");
+      throw new MegaInventoryUnavailableError("request");
+    }
+    const value = result.code === -1 ? await this.#inventoryByHouse(lifetime, options.allowPartial === true) : this.#decodeResult(result);
+    if (!isRecord(value) || !Array.isArray(value.devices)) throw new Error("Mega returned an invalid device inventory");
+    lifetime.throwIfAborted();
+    const chargingDays = options.includeChargingDays === false ? new Map<string, unknown>()
+      : await this.#legacyChargingDays(cancellation).catch(() => new Map<string, unknown>());
+    lifetime.throwIfAborted();
+    const projected = projectMegaInventory(value, chargingDays);
+    return result.code === -1 && options.allowPartial === true && isRecord(value) && value.complete === false
+      ? { ...projected, complete: false } : projected;
+  }
+
+  /**
+   * Recover only the primary inventory's application-error refusal through the
+   * SDK's default and per-house reads under the same account binding. Startup
+   * may explicitly retain fresh affirmative rows with complete=false. Normal
+   * reads and control confirmation require every page. Conflicting bindings
+   * are always rejected, and no login or device command is replayed.
+   */
+  async #inventoryByHouse(parent: AbortSignal, allowPartial: boolean): Promise<{ devices: Record<string, unknown>[]; complete?: boolean }> {
+    const bound = this.authenticatedBinding();
+    const signal = AbortSignal.any([parent, AbortSignal.timeout(60_000)]);
+    const current = (): void => {
+      signal.throwIfAborted();
+      if (!bound?.()) throw new Error("Inventory fallback binding changed");
+    };
+    const unavailable = Symbol("inventory application refusal");
+    const read = async (path: string, body: Record<string, unknown>): Promise<unknown> => {
+      current();
+      const reply = await this.#call("house", path, body, false, undefined, signal, { onDispatch: current });
+      current();
+      if (reply.code === -1) {
+        const stage = path.endsWith("get_house_list") ? "houses" : Object.hasOwn(body, "house_id") ? "house_page" : "default_page";
+        createLogger("mega").warn("inventory_house_read_unavailable", `stage=${stage} application_code=-1`);
+        return unavailable;
+      }
+      return this.#decodeResult(reply);
+    };
+    const rows = new Map<string, Record<string, unknown>>();
+    const add = (page: unknown): void => {
+
+      // The authenticated house API returns this exact successful empty-page
+      // shape. It contributes no device or ownership evidence. A refused root
+      // still makes the final inventory incomplete and retains paced recovery.
+      if (isRecord(page) && page.devices === null && page.groups === null) return;
+      if (!isRecord(page) || !Array.isArray(page.devices) || page.devices.length > 2048) throw new Error("Inventory fallback page is invalid");
+      for (const row of page.devices) {
+        if (!isRecord(row) || typeof row.device_sn !== "string" || row.device_sn.length < 1 || row.device_sn.length > 128) throw new Error("Inventory fallback device is invalid");
+        const old = rows.get(row.device_sn);
+        const binding = (value: Record<string, unknown>): string => JSON.stringify([
+          value.device_model, value.device_type, value.parent_sn, value.device_channel, value.category,
+          isRecord(value.member) ? value.member.admin_user_id : null, value.p2p_did,
+        ]);
+        if (old && binding(old) !== binding(row)) throw new Error("Inventory fallback device binding conflicts");
+        rows.set(row.device_sn, row);
+        if (rows.size > 2048) throw new Error("Inventory fallback device limit exceeded");
+      }
+    };
+    const initial = await read("/app/house/get_devs_list", {});
+    let incomplete = initial === unavailable;
+    if (!incomplete) add(initial);
+    const houses = await read("/app/house/get_house_list", {});
+    if (houses === unavailable) {
+      if (allowPartial && rows.size > 0) {
+        createLogger("mega").warn("inventory_house_fallback_partial", `houses=unknown devices=${rows.size} complete=false`);
+        return { devices: [...rows.values()], complete: false };
+      }
+      throw new MegaInventoryUnavailableError("houses");
+    }
+    if (!isRecord(houses) || !Array.isArray(houses.house_infos) || houses.house_infos.length > 16) throw new Error("Inventory fallback house list is invalid");
+    const identifiers = new Set<string>();
+    for (const house of houses.house_infos) {
+      if (!isRecord(house) || typeof house.house_id !== "string" || !house.house_id.trim() || house.house_id.length > 128
+        || identifiers.has(house.house_id)) throw new Error("Inventory fallback house identity is invalid");
+      identifiers.add(house.house_id);
+      const page = await read("/app/house/get_devs_list", { house_id: house.house_id });
+      if (page === unavailable) incomplete = true;
+      else add(page);
+    }
+    current();
+    if (incomplete) {
+      createLogger("mega").warn("inventory_house_fallback_partial", `houses=${identifiers.size} devices=${rows.size} complete=false`);
+      if (allowPartial && rows.size > 0) return { devices: [...rows.values()], complete: false };
+      throw new MegaInventoryUnavailableError("pages");
+    }
+    createLogger("mega").info("inventory_house_fallback", `Complete account inventory recovered: houses=${identifiers.size} devices=${rows.size}`);
+    return { devices: [...rows.values()] };
+  }
+
+  /**
+   * Read cloud recording metadata for one inventory camera without fetching
+   * media or altering recordings. Local HomeBase storage is a separate API.
+   */
+  async cloudHistory(cameraSerial: string, query: CloudHistoryQuery): Promise<readonly CloudHistoryRecord[]> {
+    this.#requireAuthentication();
+    validateCloudHistoryQuery(query);
+    if (!cameraSerial) throw new SyntaxError("Cloud history requires a camera");
+    const result = await this.#call("security", "/v3/event/app/get_all_video_record", {
+      device_sn: cameraSerial, start_time: query.startTime, end_time: query.endTime,
+      offset: query.timezoneOffset ?? 0, id: query.cursor ?? 0, num: query.count ?? 100,
+      pullup: true, shared: true, storage: 2,
+    });
+    return projectCloudHistory(this.#decodeResult(result), cameraSerial, query.count ?? 100);
+  }
+
+  /** Read unconfirmed calendar hints without retries, media access or account changes. */
+  async cloudCalendar(camera: string, station: string, query: CloudCalendarQuery, signal: AbortSignal): Promise<CloudCalendarProjection> {
+    const session = this.#session;
+    if (!this.isAuthenticated || !session) throw new CloudCalendarError("auth");
+    if (!camera || !station) throw new CloudCalendarError("admission");
+    let start: number, end: number;
+    try { ({ start, end } = cloudCalendarBounds(query)); }
+    catch { throw new CloudCalendarError("request"); }
+    if (signal.aborted) throw new CloudCalendarError("cancelled");
+    let result: MegaResult;
+    try {
+      result = await this.#call("security", "/v3/event/web/get_history_by_time", {
+        device_sn: camera, station_sn: station, start_time: start, end_time: end,
+        offset: query.timezoneOffset, storage: 2, shared: true,
+      }, false, undefined, signal);
+    } catch { throw new CloudCalendarError(signal.aborted ? "cancelled" : "request"); }
+    if (signal.aborted) throw new CloudCalendarError("cancelled");
+    if (!this.isAuthenticated || this.#session?.userId !== session.userId || this.#session?.authToken !== session.authToken) throw new CloudCalendarError("auth");
+    if (result.code !== 0) throw new CloudCalendarError("response");
+    try { return projectCloudCalendar(this.#decodeResult(result), query, camera, station); }
+    catch { throw new CloudCalendarError("response"); }
+  }
+
+  /**
+   * Prepare one user-consented cloud clip from a fresh camera/parent history binding.
+   * This read-only experiment never changes subscriptions, recordings or settings.
+   * Temporary URLs, the recovered key and downloaded source stay operation-owned.
+   */
+  async cloudRecordingTrial(camera: string, station: string, id: string, query: CloudHistoryQuery,
+    cancellation: AbortSignal): Promise<Buffer> {
+    this.#requireAuthentication();
+    const session = this.#session!;
+    const signal = AbortSignal.any([cancellation, this.#requestLifetime.signal, AbortSignal.timeout(90_000)]);
+    let stage: CloudRecordingStage = "history", key: Buffer | null = null, media: Buffer | null = null;
+    const current = (): void => {
+      signal.throwIfAborted();
+      if (this.#session?.authToken !== session.authToken || this.#session?.userId !== session.userId
+        || this.#session?.openUdid !== session.openUdid) throw new CloudRecordingError("cancelled");
+    };
+    try {
+      current(); validateCloudHistoryQuery(query);
+      const history = await this.#call("security", "/v3/event/app/get_all_video_record", {
+        device_sn: camera, start_time: query.startTime, end_time: query.endTime,
+        offset: query.timezoneOffset ?? 0, id: query.cursor ?? 0, num: query.count ?? 100,
+        pullup: true, shared: true, storage: 2,
+      }, false, undefined, signal);
+      current(); stage = "ownership";
+      const reference = selectCloudRecording(this.#decodeResult(history), camera, station, id, query);
+      stage = "url";
+      const renewed = await this.#call("security", "/v3/event/app/get_kvs_urls", {
+        monitor_ids: [reference.monitorId], user_id: reference.cipherOwner,
+      }, false, undefined, signal);
+      current(); const url = cloudRecordingUrl(this.#decodeResult(renewed), reference);
+      if (reference.encryptedKey) {
+        stage = "key";
+        if (reference.cipherId === null) throw new CloudRecordingError("key");
+        const label = randomIdentifier();
+        const result = await this.#call("security", "/v3/web/cipher/dec_aes_keys", {
+          user_id: reference.keyOwner,
+          cipher_keys: [{ cipher_id: reference.cipherId, aes_keys: { uuid: label, [label]: reference.encryptedKey } }],
+        }, false, undefined, signal);
+        current(); key = cloudRecordingKey(this.#decodeResult(result), reference.cipherId, label);
+      }
+      stage = "download"; media = await this.#downloadCloudRecording(url, signal);
+      current(); stage = "video";
+      const clip = await prepareCloudRecording(media, key, signal);
+      try { current(); } catch (error) { clip.fill(0); throw error; }
+      return clip;
+    } catch (error) {
+      throw error instanceof CloudRecordingError ? error : new CloudRecordingError(signal.aborted ? "cancelled" : stage);
+    } finally { key?.fill(0); media?.fill(0); }
+  }
+
+  /** Download only the selected native media location, with no account headers to object storage. */
+  async #downloadCloudRecording(value: string, signal: AbortSignal): Promise<Buffer> {
+    const url = allowedMediaUrl(value, new RegExp(`${MEDIA_HOST.source}|${MEDIA_OBJECT_HOST.source}`));
+    const response = MEDIA_HOST.test(url.hostname) ? (await this.#fetchMedia(url, signal)).response
+      : await this.#fetch(url, { redirect: "manual", signal });
+    if (!response.ok) { await response.body?.cancel(); throw new CloudRecordingError("download"); }
+    return await readBoundedResponse(response, 32 * 1024 * 1024, signal);
+  }
+
+  /** Read the established Security inventory field without retaining its other device data. */
+  async #legacyChargingDays(cancellation?: AbortSignal): Promise<ReadonlyMap<string, unknown>> {
+    const result = await this.#call("security", "/v2/house/device_list", {
+      device_sn: "",
+      num: 1_000,
+      orderby: "",
+      page: 0,
+      station_sn: "",
+      time_zone: new Date(this.#now()).getTimezoneOffset() * -60_000,
+      transaction: `${this.#now()}`,
+    }, true, undefined, cancellation);
+    const decoded = this.#decodeResult(result);
+    const rows = Array.isArray(decoded)
+      ? decoded
+      : isRecord(decoded) && Array.isArray(decoded.devices) ? decoded.devices : [];
+    const values = new Map<string, unknown>();
+    for (const row of rows) {
+      if (isRecord(row) && typeof row.device_sn === "string" && "charging_days" in row) {
+        values.set(row.device_sn, row.charging_days);
+      }
+    }
+    return values;
+  }
+
+  /**
+   * Identify rejected sessions for the caller's one-shot inventory recovery.
+   * The normal login path retains CAPTCHA and verification challenges.
+   */
+  isSessionInvalidError(error: unknown): boolean {
+    if (error instanceof MegaHttpAuthenticationRejection) return error.sessionRejected;
+    return error instanceof Error && (error.message === "Mega request failed (HTTP 401)" || [...AUTH_SESSION_INVALID_CODES].some((code) => error.message.includes(`Mega request failed (${code}:`)) ||
+      /Mega request failed \(401:.*token not exist/i.test(error.message));
+  }
+
+  /** Permit paced startup reads only for this client's fixed inventory-refusal marker. */
+  isInventoryTemporarilyUnavailable(error: unknown): boolean {
+    return error instanceof MegaInventoryUnavailableError;
+  }
+
+  /** Classify only this client's terminal login marker, without changing state or retrying. */
+  isLoginAttemptLimitError(error: unknown): boolean {
+    return error instanceof MegaLoginAttemptLimitError;
+  }
+
+  /**
+   * Fetch the short-lived DSK lookup keys used by Eufy's native PPCS camera path.
+   *
+   * The device category is part of the cloud lookup contract. Legacy string
+   * callers remain scoped to the Security family, while care devices must
+   * supply their exact category or the service omits their key.
+   */
+  async dskKeys(targets: readonly (string | {
+    readonly serial: string;
+    readonly category: "eufy_security" | "eufy_care";
+  })[]): Promise<Record<string, { readonly key: string; readonly expiresAt: number | null }>> {
+    this.#requireAuthentication();
+    const devices = targets.map((target) => typeof target === "string"
+      ? { serial: target, category: "eufy_security" as const }
+      : target);
+    const deviceDsks = devices.map(({ serial, category }) => ({ invalid_dsk: "", device_sn: serial, category }));
+    const result = await this.#call("devicerelation", "/app/devicerelation/get_dsk_keys", {
+      device_dsks: deviceDsks,
+      invalid_dsks: Object.fromEntries(devices.map(({ serial }) => [serial, ""])),
+      station_sns: devices.map(({ serial }) => serial),
+      transaction: `${this.#now()}`,
+    });
+    const decoded = this.#decodeResult(result);
+    const value: Record<string, unknown> = isRecord(decoded) ? decoded : {};
+    const output: Record<string, { readonly key: string; readonly expiresAt: number | null }> = {};
+    const keys = Array.isArray(value.device_dsks) ? value.device_dsks : [];
+    const entries = keys.length > 0
+      ? keys.map((raw) => [isRecord(raw) ? stringValue(raw.device_sn) : null, raw] as const)
+      : Object.entries(value);
+    for (const [serial, raw] of entries) {
+      if (!serial) continue;
+      if (!isRecord(raw)) continue;
+      const key = stringValue(raw.dsk_key);
+      if (!key) continue;
+      const expiration = numberValue(raw.expiration);
+      output[serial] = { key, expiresAt: expiration === null ? null : expiration * 1_000 };
+    }
+    return output;
+  }
+
+  /** Fetch the ECC private keys used by direct media or a station's level-two PPCS session. */
+  async getCiphers(cipherIds: readonly number[], userId: string, stationSerial: string): Promise<readonly Record<string, unknown>[]> {
+    this.#requireAuthentication();
+    const result = await this.#call("security", "/v3/app/cipher/get_ciphers", {
+      cipher_ids: [...cipherIds], user_id: userId, station_sn: stationSerial,
+    });
+    const decoded = this.#decodeResult(result);
+    if (Array.isArray(decoded)) return decoded.filter(isRecord);
+    if (!isRecord(decoded)) return [];
+    const values = Array.isArray(decoded.ciphers) ? decoded.ciphers : Array.isArray(decoded.data) ? decoded.data : [];
+    return values.filter(isRecord);
+  }
+
+  /**
+   * Resolve an owned event-picture key from account encryption metadata.
+   * Picture key identifiers are separate from live transport cipher identifiers.
+   * Shared-owner and protected keys fail closed. The returned buffer belongs to
+   * the caller, which must clear it after use. This method never caches or
+   * persists keys; response strings remain subject to JavaScript heap cleanup.
+   */
+  async getEventImageKey(keyId: number, ownerId: string): Promise<Buffer> {
+    if (!this.isAuthenticated || !Number.isInteger(keyId) || keyId < 2 || keyId > 255 ||
+      !ownerId || ownerId !== this.#session!.userId) {
+      throw new Error("Event picture key unavailable");
+    }
+    const token = this.#session!.authToken;
+    const signal = this.#requestLifetime.signal;
+    let decoded: unknown;
+    try {
+      const result = await this.#call("security", "/v2/commerce/get_current_subscription", {
+        new_etoe_version: 1, service_code: "all.service", is_new_version: 1,
+        has_eufy_protection_pro: 2, transaction: `${this.#now()}`,
+      }, false);
+      decoded = this.#decodeResult(result);
+    } catch {
+      throw new Error("Event picture key lookup failed");
+    }
+    if (signal.aborted) throw new Error("Event picture key lookup failed");
+    if (signal !== this.#requestLifetime.signal || this.#session?.authToken !== token ||
+      this.#session.userId !== ownerId) {
+      throw new Error("Event picture key session changed");
+    }
+    if (!isRecord(decoded) || !Array.isArray(decoded.simple_security_keys) || decoded.simple_security_keys.length > 256) {
+      throw new Error("Event picture key unavailable");
+    }
+    const matches = decoded.simple_security_keys.filter((entry: unknown) =>
+      isRecord(entry) && Number.isInteger(entry.pincode_id) && entry.pincode_id === keyId);
+    const value: unknown = matches.length === 1 ? matches[0].private_key : undefined;
+    if (typeof value !== "string" || !/^[a-fA-F0-9]{64}$/.test(value)) {
+      throw new Error("Event picture key unavailable");
+    }
+    return Buffer.from(value, "hex");
+  }
+
+  /**
+   * Register the connected Firebase receiver through Eufy's notification backend.
+   *
+   * Reuse the authenticated regional session and match the Android token fields.
+   * The receiver must complete its login first and owns bounded retries. App
+   * review invitations are unrelated to notification registration and must not
+   * gate readiness. Backend acceptance is separate from actual event delivery.
+   */
+  async registerPushToken(token: string): Promise<PushRegistrationResult> {
+    this.#requireAuthentication();
+    const result = await this.#call("push", "/app/push/register_push_token", {
+      token,
+      is_notification_enable: true,
+      voip_token: token,
+    }, false);
+    if (!isSuccess(result.code)) throw new Error(`Mega push registration failed (${result.code})`);
+    return { registered: true, code: result.code };
+  }
+
+  /**
+   * Download authenticated temporary media through Eufy's allowlisted redirect.
+   * Caller cancellation retires only this read, leaving the client lifetime intact.
+   */
+  async download(url: string, maximumBytes = 20 * 1024 * 1024, signal?: AbortSignal): Promise<Buffer> {
+    return (await this.downloadWithMetadata(url, maximumBytes, signal)).data;
+  }
+
+  /**
+   * Read allowlisted media within one 30-second lifetime, retrying only404 while
+   * a cloud object becomes ready. Discarded bodies and delay timers retire on
+   * shutdown or caller cancellation. Metadata contains no private headers or URL.
+   */
+  async downloadWithMetadata(url: string, maximumBytes = 20 * 1024 * 1024, signal?: AbortSignal): Promise<{ data: Buffer } & EventImageResponseMetadata> {
+    return this.#downloadMedia(url, maximumBytes, signal);
+  }
+
+  /** Own authenticated media retries, redirect handling, body limits and cancellation. */
+  async #downloadMedia(url: string, maximumBytes: number, ownerSignal?: AbortSignal): Promise<{ data: Buffer } & EventImageResponseMetadata> {
+    const parsed = allowedMediaUrl(url, MEDIA_HOST);
+    const signal = AbortSignal.any([this.#requestLifetime.signal, AbortSignal.timeout(30_000), ...(ownerSignal ? [ownerSignal] : [])]);
+    let response: Response | null = null;
+    let request: { response: Response; initial: string; redirect?: string } | null = null;
+    let attempts = 0;
+    for (let attempt = 0; attempt <= MEDIA_NOT_READY_DELAYS_MS.length; attempt += 1) {
+      signal.throwIfAborted();
+      request = await this.#fetchMedia(parsed, signal);
+      response = request.response;
+      attempts += 1;
+      if (response.status !== 404 || attempt === MEDIA_NOT_READY_DELAYS_MS.length) break;
+      const delay = MEDIA_NOT_READY_DELAYS_MS[attempt];
+      if (delay === undefined) break;
+      await this.#discardMediaResponse(response, signal);
+      await this.#waitForMediaRetry(delay, signal);
+    }
+    if (!response) throw new Error("Mega media download failed");
+    if (!response.ok) {
+      await this.#discardMediaResponse(response, signal);
+      signal.throwIfAborted();
+      throw new MediaHttpError(response.status, attempts, request?.initial ?? "unknown", request?.redirect);
+    }
+    const data = await readBoundedResponse(response, maximumBytes, signal);
+    return { data, ...eventImageResponseMetadata(response) };
+  }
+
+  async #discardMediaResponse(response: Response, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(signal.reason ?? new Error("Media request cancelled"));
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    });
+    try {
+      await Promise.race([Promise.resolve().then(() => response.body?.cancel()).catch(() => undefined), cancelled]);
+      signal.throwIfAborted();
+    } finally { signal.removeEventListener("abort", abort); }
+  }
+
+  #waitForMediaRetry(milliseconds: number, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const finish = (error?: unknown): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        if (error !== undefined) reject(error); else resolve();
+      };
+      const abort = (): void => finish(signal.reason ?? new Error("Media request cancelled"));
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) { abort(); return; }
+      if (this.#wait) {
+        try { void this.#wait(milliseconds).then(() => finish(), error => finish(error)); }
+        catch (error) { finish(error); }
+      } else timer = setTimeout(() => finish(), milliseconds);
+    });
+  }
+
+  /** Perform one authenticated media lookup and its optional credential-free object-store redirect. */
+  async #fetchMedia(url: URL, signal: AbortSignal): Promise<{ response: Response; initial: string; redirect?: string }> {
+    signal.throwIfAborted();
+    let response = await this.#fetch(url, {
+      headers: this.#mediaHeaders(), redirect: "manual", signal,
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      await this.#discardMediaResponse(response, signal);
+      if (!location) throw new Error("Mega media download rejected");
+      const target = allowedMediaUrl(location, MEDIA_OBJECT_HOST);
+      signal.throwIfAborted();
+      response = await this.#fetch(target, { redirect: "manual", signal });
+      return { response, initial: mediaRequestDiagnostic(url), redirect: mediaRequestDiagnostic(target) };
+    }
+    return { response, initial: mediaRequestDiagnostic(url) };
+  }
+
+  /**
+   * Obtain a transient RTC join context from the existing authenticated session.
+   *
+   * Automatic routing first resolves the credential-free WEB service region.
+   * Explicit overrides skip discovery. Queueing, discovery and signing share a
+   * ten-second deadline, and a replaced session or failed discovery cannot send
+   * its token to a newly discovered host. Account domains remain unchanged.
+   */
+  async nvrSignallingContext(station: string, region: "auto" | "us" | "eu" | "ie", cancellation: AbortSignal): Promise<NvrSignallingContext> {
+    this.#requireAuthentication();
+    const session = this.#session!;
+    const deadline = AbortSignal.any([cancellation, AbortSignal.timeout(10_000)]);
+    const pending = this.#enqueue(async lifetime => {
+      const signal = AbortSignal.any([lifetime, deadline]); signal.throwIfAborted();
+      try {
+        const selected = region === "auto" ? await discoverNvrServiceRegion(this.#fetch, this.#country, signal) : region;
+        signal.throwIfAborted();
+        if (this.#session !== session) throw new NvrTrialError("cancelled");
+        const host = selected === "us" ? "security-smart.eufylife.com" : `security-smart-${selected}.eufylife.com`;
+        const response = await this.#fetch(`https://${host}/v1/smart/nvr/ws/sign?station_sn=${encodeURIComponent(station)}`, {
+          headers: { "app-name": "eufy_mega", "model-type": "WEB", "web-country": this.#country.toUpperCase(),
+            gtoken: megaUserToken(session.userId), "x-auth-token": session.authToken, authorization: session.authToken },
+          redirect: "manual", signal,
+        });
+        if (!response.ok) { await response.body?.cancel(); throw new NvrTrialError("region_or_authorization_rejected", "unspecified", response.status); }
+        const value: unknown = JSON.parse((await readBoundedResponse(response, 65536, signal)).toString("utf8"));
+        if (!isRecord(value) || value.code !== 0 || typeof value.data !== "string" || !value.data.length || value.data.length > 8192) {
+          throw new NvrTrialError("region_or_authorization_rejected", "unspecified", response.status);
+        }
+        if (this.#session !== session) throw new NvrTrialError("cancelled");
+        return { host, region: selected.toUpperCase() as "US" | "EU" | "IE", authToken: session.authToken,
+          gtoken: megaUserToken(session.userId), sign: value.data };
+      } catch (error) {
+        throw error instanceof NvrTrialError ? error : new NvrTrialError(cancellation.aborted ? "cancelled" : "sign");
+      }
+    });
+    return await new Promise<NvrSignallingContext>((resolve, reject) => {
+      const abort = (): void => { deadline.removeEventListener("abort", abort);
+        reject(new NvrTrialError(cancellation.aborted ? "cancelled" : "sign")); };
+      deadline.addEventListener("abort", abort, { once: true });
+      void pending.then(resolve, reject).finally(() => deadline.removeEventListener("abort", abort));
+      if (deadline.aborted) abort();
+    });
+  }
+
+  #mediaHeaders(): Record<string, string> {
+    this.#requireAuthentication();
+    return {
+      accept: "image/*",
+      "app-name": "eufy_mega",
+      "model-type": "PHONE",
+      "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; SM-G991B Build/UP1A.231005.007)",
+      gtoken: megaUserToken(this.#session!.userId),
+      "x-auth-token": this.#session!.authToken,
+    };
+  }
+
+  async #restore(): Promise<void> {
+    const restored = await this.#store.load();
+    if (!restored) {
+      const openUdid = await this.#store.loadRetiredOpenUdid();
+      if (openUdid) {
+        this.#session = emptySession(
+          this.#country,
+          openUdid,
+          credentialVerifier(openUdid, this.#email, this.#password),
+        );
+      }
+      return;
+    }
+    const expectedVerifier = credentialVerifier(restored.openUdid, this.#email, this.#password);
+    if (restored.country.toLowerCase() !== this.#country || restored.credentialVerifier !== expectedVerifier) {
+      this.#session = emptySession(this.#country, restored.openUdid, expectedVerifier);
+      if (restored.generalRtcIdentity) {
+        await this.#store.save(nativeOnlySession(restored));
+        createLogger("mega").info("general_rtc_identity_dropped", "reason=binding");
+      }
+      return;
+    }
+    this.#session = restored;
+    if (restored.generalRtcIdentity && (!this.#experimentalGeneralRtc || !this.generalRtcCipher())) {
+      const nativeSession = nativeOnlySession(restored);
+      this.#session = nativeSession;
+      createLogger("mega").info("general_rtc_identity_dropped", this.#experimentalGeneralRtc ? "reason=binding" : "reason=disabled");
+      await this.#store.save(nativeSession);
+    }
+  }
+
+  async #ensureDomain(): Promise<void> {
+    if (this.#session?.megaDomain) return;
+    const host = `mega-${this.#country === "us" ? "us" : "eu"}-pr.eufy.com`;
+    const result = await this.#postClear(host, "/passport/estimate_domain", { ab: this.#country, mode: 1 });
+    if (!isSuccess(result.code) || !isRecord(result.data)) {
+      throw new Error(`Mega domain discovery failed (${result.code}: ${safeMegaMessage(result.msg)})`);
+    }
+    const domain = stringValue(result.data.domain);
+    if (!domain || !isStringRecord(result.data.product_domains)) throw new Error("Mega returned an invalid domain profile");
+    const openUdid = this.#session?.openUdid ?? randomIdentifier();
+    this.#session = {
+      ...(this.#session ?? emptySession(this.#country, openUdid, credentialVerifier(openUdid, this.#email, this.#password))),
+      megaDomain: domain,
+      domains: result.data.product_domains,
+    };
+  }
+
+  #clusterHost(service: string): string {
+    if (service === "security" && this.#session?.domains.eufy_security) {
+      const host = this.#session.domains.eufy_security;
+      return host === "security-app.eufylife.com"
+        ? (this.#session.megaDomain.includes("-us-") ? "security-app.eufylife.com" : "security-app-eu.eufylife.com")
+        : host;
+    }
+    if (this.#session?.megaDomain.startsWith("mega-")) {
+      return this.#session.megaDomain.replace(/^mega-/, `app-${service}-`);
+    }
+    return `app-${service}-${this.#country === "us" ? "us" : "eu"}-pr.eufy.com`;
+  }
+
+  async #identity(host: string): Promise<MegaIdentity> {
+    const saved = this.#session?.identities[host];
+    if (saved) return saved;
+    const flight = this.#identityFlights.get(host);
+    if (flight) return flight;
+    const exchange = this.#exchangeIdentity(host);
+    this.#identityFlights.set(host, exchange);
+    try {
+      return await exchange;
+    } finally {
+      if (this.#identityFlights.get(host) === exchange) this.#identityFlights.delete(host);
+    }
+  }
+
+  async #exchangeIdentity(host: string): Promise<MegaIdentity> {
+    const lifetime = this.#requestLifetime.signal;
+    const eufyLife = host.endsWith(".eufylife.com");
+    const localKey = eufyLife ? EUFYLIFE_PRESET_KEY : MEGA_PRESET_KEY;
+    const pending = beginKeyExchange(localKey);
+    const result = await this.#signedPost(host, eufyLife ? "/v3/openapi/oauth/key/exchange" : "/openapi/oauth/key/exchange", undefined, undefined, {
+      keyIdent: pending.keyIdent,
+      encryptedPublicKey: pending.encryptedPublicKey,
+    });
+    if (!isSuccess(result.code) || !isRecord(result.data)) {
+      throw new Error(`Mega key exchange failed (${result.code}: ${safeMegaMessage(result.msg)})`);
+    }
+    const encryptedServerPublicKey = stringValue(result.data.server_public_key);
+    if (!encryptedServerPublicKey) throw new Error("Mega key exchange omitted the server public key");
+    lifetime.throwIfAborted();
+    const identity = finishKeyExchange(pending, encryptedServerPublicKey, localKey);
+    const base = this.#session ?? emptySession(this.#country, randomIdentifier(), "");
+    this.#session = { ...base, identities: { ...base.identities, [host]: identity } };
+    return identity;
+  }
+
+  #cachedNativeIdentity(host: string): MegaIdentity | null {
+    const identity = this.#session?.identities[host];
+    return identity && /^[A-Za-z0-9_-]{1,128}$/.test(identity.keyIdent) && /^[a-f0-9]{64}$/i.test(identity.sharedKey)
+      ? identity : null;
+  }
+
+  #generalRtcResult(result: MegaResult, stage: GeneralRtcStage): unknown {
+    if (result.code !== 0) throw new GeneralRtcError(stage, TRANSIENT_IDENTITY_ERRORS.has(result.code) ? "native_identity_rejected" : "response");
+    return this.#decodeResult(result);
+  }
+
+  async #call(service: string, path: string, payload: unknown, retryIdentity = true, appScope?: "eufy_security", cancellation?: AbortSignal,
+    options?: GeneralRtcCallOptions): Promise<MegaResult> {
+    const lifetime = cancellation ? AbortSignal.any([this.#requestLifetime.signal, cancellation]) : this.#requestLifetime.signal;
+    lifetime.throwIfAborted();
+    const host = this.#clusterHost(service);
+    const identityHost = host.endsWith(".eufylife.com") ? host : this.#clusterHost("openapi");
+    const identity = options?.cachedIdentityOnly ? this.#cachedNativeIdentity(identityHost) : await this.#identity(identityHost);
+    if (!identity) throw new GeneralRtcError("admission", "native_identity_missing");
+    if (options?.cachedIdentityOnly) retryIdentity = false;
+    lifetime.throwIfAborted();
+    const trialAccount = options?.cachedIdentityOnly ? this.generalRtcAccount() : null;
+    const onDispatch = options?.cachedIdentityOnly ? (): void => {
+      const current = this.generalRtcAccount();
+      const cached = this.#cachedNativeIdentity(identityHost);
+      if (!cached || cached !== identity) throw new GeneralRtcError("admission", cached ? "native_identity_rejected" : "native_identity_missing");
+      if (!current || !trialAccount || current.token !== trialAccount.token || current.userId !== trialAccount.userId
+        || current.cipher?.bindingKey !== trialAccount.cipher?.bindingKey) throw new GeneralRtcError("binding", "binding");
+      options.onDispatch?.();
+    } : options?.onDispatch;
+    let result: MegaResult;
+    try {
+      const pending = this.#signedPost(host, path, payload, identity, undefined, appScope, cancellation, onDispatch, options?.onResponseStatus, options?.portalInventory);
+      result = options?.cachedIdentityOnly ? await generalRtcAwait(pending, lifetime, "admission") : await pending;
+    } catch (error) {
+      lifetime.throwIfAborted();
+      if (!retryIdentity || path !== "/v3/app/cipher/get_ciphers" || !(error instanceof MegaHttpRejection)
+        || !["empty", "empty_or_truncated"].includes(error.responseKind)) throw error;
+
+      // An empty rejection does not prove expiry. Replay only this read, with
+      // key exchange rather than login, and cap attempts across all cameras.
+      if (this.#session?.identities[identityHost] === identity) {
+        const previous = this.#cipherIdentityRecoveryAt.get(identityHost);
+        const now = this.#now();
+        if (previous !== undefined && now - previous < CIPHER_IDENTITY_RECOVERY_INTERVAL_MS) throw error;
+        this.#cipherIdentityRecoveryAt.set(identityHost, now);
+      }
+      const refreshedIdentity = await this.#renewIdentity(identityHost, identity);
+      lifetime.throwIfAborted();
+      return this.#signedPost(host, path, payload, refreshedIdentity, undefined, appScope, cancellation);
+    }
+    lifetime.throwIfAborted();
+    if (retryIdentity && TRANSIENT_IDENTITY_ERRORS.has(result.code)) {
+      const refreshedIdentity = await this.#renewIdentity(identityHost, identity);
+      lifetime.throwIfAborted();
+      const retried = await this.#signedPost(host, path, payload, refreshedIdentity, undefined, appScope, cancellation, options?.onDispatch);
+      lifetime.throwIfAborted();
+      return retried;
+    }
+    return result;
+  }
+
+  async #renewIdentity(host: string, rejected: MegaIdentity): Promise<MegaIdentity> {
+    const flight = this.#identityRecoveryFlights.get(host);
+    if (flight) return flight;
+    if (this.#session?.identities[host] !== rejected) return this.#identity(host);
+    const lifetime = this.#requestLifetime.signal;
+    const renewal = (async () => {
+      const identities = { ...this.#session!.identities };
+      delete identities[host];
+      this.#session = { ...this.#session!, identities };
+      const identity = await this.#identity(host);
+      lifetime.throwIfAborted();
+
+      // Share persistence as well as exchange so concurrent rejected reads
+      // cannot race the session store's atomic replacement file.
+      await this.#save();
+      lifetime.throwIfAborted();
+      return identity;
+    })();
+    this.#identityRecoveryFlights.set(host, renewal);
+    try {
+      return await renewal;
+    } finally {
+      if (this.#identityRecoveryFlights.get(host) === renewal) this.#identityRecoveryFlights.delete(host);
+    }
+  }
+
+  async #signedPost(
+    host: string,
+    path: string,
+    payload: unknown,
+    identity?: MegaIdentity,
+    bootstrap?: { readonly keyIdent: string; readonly encryptedPublicKey: string },
+    appScope?: "eufy_security",
+    cancellation?: AbortSignal,
+    onDispatch?: () => void,
+    onResponseStatus?: (status: number) => void,
+    portalInventory?: true,
+  ): Promise<MegaResult> {
+    return this.#enqueue(async (lifetime) => {
+      const signal = cancellation ? AbortSignal.any([lifetime, cancellation]) : lifetime;
+      signal.throwIfAborted();
+      const timestamp = `${Math.floor(this.#now() / 1_000)}`;
+      const nonce = randomIdentifier();
+      const encrypted = bootstrap?.encryptedPublicKey ?? encryptEnvelope(JSON.stringify(payload), sharedAesKey(identity!.sharedKey));
+      const body = bootstrap ? JSON.stringify({ client_public_key: encrypted }) : encrypted;
+      const signingKey = bootstrap
+        ? (host.endsWith(".eufylife.com") ? EUFYLIFE_PRESET_KEY : MEGA_PRESET_KEY)
+        : sharedSigningKey(identity!.sharedKey);
+      const headers = this.#headers(
+        bootstrap?.keyIdent ?? identity!.keyIdent, timestamp, nonce,
+        requestSignature(signingKey, timestamp, nonce, encrypted),
+      );
+
+      // EufyLife data requests carry opaque encrypted text. Mega and the
+      // JSON key-exchange bootstrap retain their existing content types.
+      if (!bootstrap && host.endsWith(".eufylife.com")) headers["content-type"] = "text/plain";
+
+      // The native cipher API routes the Security family independently of app-name.
+      if (!bootstrap && host.endsWith(".eufylife.com") && path === "/v3/app/cipher/get_ciphers") {
+        headers["app-tab"] = "eufy_security";
+      }
+      if (portalInventory) {
+
+        // The portal inventory wrapper selects the Security web profile. Reuse
+        // the admitted identity without exchanging keys or changing the session.
+        headers["app-name"] = "eufy_security";
+        headers.model_type = "WEB";
+        headers["web-country"] = this.#country.toUpperCase();
+        delete headers["model-type"];
+      }
+      if (appScope) headers["app-name"] = appScope;
+      if (path === "/v3/web/wp/verify_captcha") headers["X-Auto-Ts"] = timestamp;
+      const result = await this.#post(host, path, body, headers, signal, onDispatch, onResponseStatus);
+      this.#responseOperations.set(result, megaOperation(path));
+      if (identity) {
+
+        // Only the normal general-client family has an established response
+        // signature contract. Bootstrap and native Mega do not inherit it.
+        if (host.endsWith(".eufylife.com") && typeof result.data === "string" && result.data) {
+          const signature = (result as MegaResult & { signature?: unknown }).signature;
+          const required = path.startsWith("/v3/event/") || path === "/v3/web/cipher/dec_aes_keys";
+          if (required || signature !== undefined) {
+            const expected = requestSignature(signingKey, timestamp, nonce, result.data);
+            if (typeof signature !== "string" || !/^[a-f0-9]{64}$/i.test(signature) ||
+              !timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expected, "hex"))) {
+              throw new Error("Mega response validation failed (signature)");
+            }
+          }
+        }
+        this.#responseIdentities.set(result, identity);
+      }
+      return result;
+    });
+  }
+
+  async #postClear(host: string, path: string, payload: unknown): Promise<MegaResult> {
+    return this.#enqueue((signal) => this.#post(host, path, JSON.stringify(payload), {
+      "app-name": "eufy_mega",
+      "app-version": "6.0.51_26722",
+      "os-type": "android",
+      "content-type": "application/json",
+    }, signal));
+  }
+
+  async #enqueue<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const signal = this.#requestLifetime.signal;
+    signal.throwIfAborted();
+    const job = this.#requestTail.then(async () => {
+      signal.throwIfAborted();
+      const wait = this.#lastRequestAt + this.#minimumRequestIntervalMs - this.#now();
+      if (wait > 0) await delay(wait, undefined, { signal });
+      signal.throwIfAborted();
+      this.#lastRequestAt = this.#now();
+      return operation(AbortSignal.any([signal, AbortSignal.timeout(30_000)]));
+    });
+
+    // A refused or cancelled job must not poison the next queue position.
+    this.#requestTail = job.catch(() => undefined);
+    return job;
+  }
+
+  async #post(host: string, path: string, body: string, headers: Record<string, string>, signal: AbortSignal, onDispatch?: () => void, onResponseStatus?: (status: number) => void): Promise<MegaResult> {
+    let response: Response;
+    signal.throwIfAborted();
+    onDispatch?.();
+    try {
+      response = await this.#fetch(`https://${host}${path}`, {
+        method: "POST", headers, body, signal, redirect: "error",
+      });
+    } catch {
+      signal.throwIfAborted();
+      throw new Error("Mega request failed (transport)");
+    }
+    signal.throwIfAborted();
+    onResponseStatus?.(response.status);
+    if (response.status !== 200) {
+      if (response.status === 401) {
+        let code: number | null = null;
+        let rejected = false;
+        let responseKind: "empty" | "json" | "non_json" | "unavailable" = "unavailable";
+        try {
+          const body = await readBoundedResponse(response, 64 * 1024, signal);
+          responseKind = body.length === 0 ? "empty" : "non_json";
+          const value: unknown = JSON.parse(body.toString("utf8"));
+          responseKind = "json";
+          if (isRecord(value) && Number.isSafeInteger(value.code)) {
+            code = value.code as number;
+            if (TRANSIENT_IDENTITY_ERRORS.has(code)) return value as unknown as MegaResult;
+            rejected = !!headers["x-auth-token"] && !["login", "account_check", "captcha"].includes(megaOperation(path))
+              && rejectedAuthToken(code, value.msg);
+          }
+        } catch {
+          signal.throwIfAborted();
+        }
+        throw new MegaHttpAuthenticationRejection(rejected, code, responseKind, megaOperation(path));
+      }
+      if (response.status === 463) {
+        let applicationCode: number | undefined;
+        let responseKind: GeneralRtcResponseClass = "unavailable";
+        try {
+          const body = await readBoundedResponse(response, 2 * 1024 * 1024, signal);
+          responseKind = body.length === 0 ? "empty" : "non_json";
+          const value: unknown = JSON.parse(body.toString("utf8"));
+          responseKind = "json_without_numeric_code";
+          if (isRecord(value) && Number.isSafeInteger(value.code)) {
+            applicationCode = value.code as number;
+            responseKind = "json_with_numeric_code";
+            if (TRANSIENT_IDENTITY_ERRORS.has(applicationCode)) return value as unknown as MegaResult;
+          }
+        } catch (error) {
+          signal.throwIfAborted();
+          if (error instanceof Error && error.message === "Cloud response is empty or truncated") {
+            responseKind = "empty_or_truncated";
+          }
+        }
+        throw new MegaHttpRejection(responseKind, applicationCode);
+      }
+      await response.body?.cancel();
+      throw new Error(`Mega request failed (HTTP ${response.status})`);
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse((await readBoundedResponse(response, 2 * 1024 * 1024, signal)).toString("utf8"));
+    } catch {
+      signal.throwIfAborted();
+      throw new Error("Mega response validation failed (JSON)");
+    }
+    signal.throwIfAborted();
+    if (!isRecord(value) || !Number.isInteger(value.code)) throw new Error("Mega response validation failed (envelope)");
+    return value as unknown as MegaResult;
+  }
+
+  #headers(keyIdent: string, timestamp: string, nonce: string, signature: string): Record<string, string> {
+    const headers: Record<string, string> = {
+      accept: "application/json",
+      "accept-charset": "UTF-8",
+      "accept-language": "en-US,en;q=0.9",
+      "app-name": "eufy_mega",
+      "app-version": "6.0.51_26722",
+      app_version: "6.0.51_26722",
+      "os-type": "android",
+      os_type: "android",
+      "os-version": "14",
+      os_version: "14",
+      "model-type": "PHONE",
+      "phone-model": "Home Assistant Eufy Gateway",
+      phone_model: "Home Assistant Eufy Gateway",
+      openudid: this.#session?.openUdid ?? "",
+      "test-flag": "false",
+      priority: "u=3, i",
+      "user-agent": "ktor-client",
+      "content-type": "application/json",
+      "x-encryption-info": "algo_ecdh",
+      "x-key-ident": keyIdent,
+      "x-request-ts": timestamp,
+      "x-request-once": nonce,
+      "x-replay-info": "replay",
+      "x-signature": signature,
+      country: this.#country.toUpperCase(),
+      language: "en",
+      ab_code: this.#country,
+    };
+    if (this.#session?.userId) headers.gtoken = megaUserToken(this.#session.userId);
+    if (this.#session?.authToken) {
+      headers["x-auth-token"] = this.#session.authToken;
+      headers.authorization = this.#session.authToken;
+    }
+    return headers;
+  }
+
+  #decodeResult(result: MegaResult): unknown {
+    const operation = this.#responseOperations.get(result) ?? "unknown";
+    if (!isSuccess(result.code)) {
+      if (result.code === VERIFICATION_REQUIRED || CAPTCHA_REQUIRED.has(result.code)) return result.data;
+      if (operation === "login" && result.code === LOGIN_CREDENTIALS_REJECTED_LEGACY) {
+        throw new Error("Mega request failed (26006: Eufy rejected the login, which the inspected official app version classifies as an incorrect email or password) operation=login");
+      }
+      if (operation === "login" && result.code === LOGIN_ATTEMPTS_REJECTED) {
+        this.#pendingCaptcha = null;
+        throw new MegaLoginAttemptLimitError();
+      }
+      if (operation === "login" && result.code === LOGIN_CREDENTIALS_REJECTED) {
+        throw new Error("Mega request failed (26108: Eufy rejected the login, which the official app reports as an incorrect email or password) operation=login");
+      }
+      throw new Error(`Mega request failed (${result.code}: ${safeMegaMessage(result.msg)}) operation=${operation}`);
+    }
+    if (typeof result.data !== "string") return result.data;
+    const identity = this.#responseIdentities.get(result);
+    if (!identity) throw new Error("Mega response cannot be decrypted without a session identity");
+    try {
+      return JSON.parse(decryptEnvelope(result.data, sharedAesKey(identity.sharedKey)));
+    } catch {
+      throw new Error(`Mega response validation failed (encrypted data) operation=${operation}`);
+    }
+  }
+
+  async #requestCaptcha(): Promise<MegaCaptcha> {
+
+    // Login uses the native no-parameter CAPTCHA overload.
+    const result = await this.#call("passport", "/passport/generate/captcha", {}, false);
+    const value = this.#decodeResult(result);
+    if (!isRecord(value)) throw new Error("Mega returned an invalid CAPTCHA challenge");
+    const id = stringValue(value.captcha_id);
+    const image = stringValue(value.item);
+    if (!id || !image) throw new Error("Mega returned an incomplete CAPTCHA challenge");
+    return { id, image };
+  }
+
+  #setAuth(
+    authToken: string,
+    userId: string,
+    tokenExpiresAt: number | null,
+    verificationPending: boolean,
+  ): void {
+    if (!this.#session) throw new Error("Mega session was not initialized");
+    const base = nativeOnlySession(this.#session);
+    this.#session = {
+      ...base,
+      authToken,
+      userId,
+      verificationPending,
+      tokenExpiresAt: tokenExpiresAt ?? Math.floor(this.#now() / 1_000) + 30 * 24 * 60 * 60,
+    };
+  }
+
+  async #save(): Promise<void> {
+    if (!this.#session) throw new Error("Mega session was not initialized");
+    await this.#store.save(this.#session);
+  }
+
+  #requireAuthentication(): void {
+    if (!this.isAuthenticated) throw new Error("Mega authentication is required");
+  }
+}
+
+function nativeOnlySession(session: MegaSession): MegaSession {
+  const { generalRtcIdentity: retiredIdentity, ...nativeSession } = session;
+  void retiredIdentity;
+  return nativeSession;
+}
+
+function generalRtcRequestFailure(error: unknown, stage: GeneralRtcStage): GeneralRtcError {
+  return new GeneralRtcError(stage, error instanceof GeneralRtcError ? error.reason : "response",
+    error instanceof GeneralRtcError ? error.inventory : undefined);
+}
+
+function projectMegaInventory(value: Record<string, unknown>, chargingDays: ReadonlyMap<string, unknown>): MegaInventory {
+  if (!Array.isArray(value.devices)) throw new Error("Mega returned an invalid device inventory");
+  return {
+    devices: value.devices.filter(isMegaDevice).map(device => {
+      const { charging_days: _placeholder, ...withoutChargingDays } = device;
+      return chargingDays.has(device.device_sn) ? { ...withoutChargingDays, charging_days: chargingDays.get(device.device_sn) } : withoutChargingDays;
+    }),
+    groups: Array.isArray(value.groups) ? value.groups : [],
+  };
+}
+
+function projectGeneralRtcInventory(hubs: readonly unknown[], devices: readonly unknown[]): MegaInventory {
+  const projectedDevices = devices.filter(isMegaDevice);
+  if (projectedDevices.length !== devices.length) throw new GeneralRtcError("inventory", "response");
+  const deviceSerials = new Set<string>();
+  for (const device of projectedDevices) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(device.device_sn) || deviceSerials.has(device.device_sn)) {
+      throw new GeneralRtcError("inventory", "topology");
+    }
+    deviceSerials.add(device.device_sn);
+  }
+  const stationSerials = new Set<string>();
+  const projectedHubs: MegaInventory["devices"][number][] = [];
+  for (const hub of hubs) {
+    if (!isRecord(hub) || typeof hub.station_sn !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(hub.station_sn)
+      || stationSerials.has(hub.station_sn)) throw new GeneralRtcError("inventory", "topology");
+    stationSerials.add(hub.station_sn);
+    if (!deviceSerials.has(hub.station_sn)) projectedHubs.push({ ...hub, device_sn: hub.station_sn });
+  }
+  return { devices: [...projectedHubs, ...projectedDevices], groups: [] };
+}
+
+function allowedMediaUrl(value: string, hostPattern: RegExp): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Mega media URL is invalid");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.port || !hostPattern.test(url.hostname)) {
+    throw new Error("Mega media URL is not an allowed Eufy host");
+  }
+  return url;
+}
+
+function emptySession(country: string, openUdid: string, verifier: string): MegaSession {
+  return {
+    version: 2,
+    country,
+    openUdid,
+    credentialVerifier: verifier,
+    authToken: "",
+    tokenExpiresAt: 0,
+    userId: "",
+    verificationPending: false,
+    megaDomain: "",
+    domains: {},
+    identities: {},
+  };
+}
+
+function isSuccess(code: number): boolean {
+  return code === 0 || code === 200;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMegaDevice(value: unknown): value is MegaInventory["devices"][number] {
+  return isRecord(value) && typeof value.device_sn === "string" && value.device_sn.length > 0;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return isRecord(value) && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function safeMegaMessage(value: string | undefined): string {
+  const known = new Set(["get identity error", "token not exist", "Failed to login."]);
+  return value && known.has(value) ? value : "application error";
+}

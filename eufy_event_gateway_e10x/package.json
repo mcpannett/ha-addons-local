@@ -1,0 +1,47 @@
+{
+  "name": "eufy-ha-gateway",
+  "version": "0.1.259",
+  "private": true,
+  "description": "Event-first Eufy camera gateway for Home Assistant",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "npm run typecheck && npm run test:shell && npm run catalogue:check && npm run translations:validate && npm run images:check && npm test",
+    "images:check": "node --import tsx scripts/generate-waiting-image.mjs --check",
+    "catalogue:check": "node scripts/device-catalogue.mjs check",
+    "catalogue:generate": "node scripts/device-catalogue.mjs generate",
+    "catalogue:new": "node scripts/new-device-catalogue.mjs",
+    "catalogue:query": "node scripts/device-catalogue.mjs query",
+    "translations:check": "node scripts/translations.mjs check",
+    "translations:generate": "node scripts/translations.mjs generate",
+    "translations:validate": "node scripts/translations.mjs validate",
+    "release:check": "node scripts/check-release-consistency.mjs",
+    "dev": "tsx watch src/main.ts",
+    "debug:push": "tsx scripts/push-debug.ts",
+    "start": "node dist/main.js",
+    "poc:ppcs": "tsx scripts/ppcs-probe.ts",
+    "poc:motion": "tsx scripts/motion-probe.ts",
+    "test": "node --import tsx --test 'test/**/*.test.ts'",
+    "test:shell": "sh -n run.sh",
+    "typecheck": "tsc --noEmit",
+    "site:build": "node ../site/build.mjs",
+    "site:test": "node --test '../site/test/*.test.mjs'"
+  },
+  "dependencies": {
+    "jpeg-js": "0.4.4",
+    "mqtt": "5.16.0",
+    "protobufjs": "^7.6.6",
+    "werift": "0.24.4",
+    "ws": "8.22.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/ws": "8.18.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

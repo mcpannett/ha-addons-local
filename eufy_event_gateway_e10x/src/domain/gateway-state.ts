@@ -1,0 +1,727 @@
+/**
+ * Implements the gateway's in-memory camera state machine.
+ *
+ * `EufyProvider` reports normalized facts here; this class owns the current
+ * connection state, camera registry, detection hold timers, retained snapshot
+ * metadata, and stream lifecycle counters. `GatewayServer` reads snapshots and
+ * forwards emitted events over SSE. It deliberately owns no Eufy credentials
+ * and performs no network or media-protocol work, so state policy can be
+ * tested without a real camera or cloud account.
+ */
+import { EventEmitter } from "node:events";
+import { e21DetectionKinds, type E21DetectionKind } from "../provider/e21-profile.js";
+import { randomUUID } from "node:crypto";
+import { maskSmartLockState, type SmartLockState } from "./types.js";
+
+import type {
+  CameraIdentity,
+  CameraState,
+  ConnectionState,
+  Detection,
+  GatewayEvent,
+  HomeBaseState,
+  SnapshotInfo,
+  StreamState,
+  PushDiagnostic,
+  InventoryDiagnostic,
+  CameraCapabilityManifest,
+  CatalogueEvidence,
+  DeviceCapabilityManifest,
+  DetectionKind,
+  SecuritySensorState,
+  EventDeliveryDiagnostic,
+  EventReceiverState,
+} from "./types.js";
+
+/** Mutable internal representation; callers receive immutable snapshots. */
+interface MutableCameraState {
+  identity: CameraIdentity;
+  rawMotionDetected: boolean;
+  motionDetected: boolean;
+  personDetected: boolean;
+  strangerDetected: boolean;
+  petDetected: boolean;
+  vehicleDetected: boolean;
+  dogDetected: boolean;
+  cryingDetected: boolean;
+  soundDetected: boolean;
+  packageDeliveredDetected: boolean;
+  packageTakenDetected: boolean;
+  packageStrandedDetected: boolean;
+  doorbellPressed: boolean;
+  lastDetection: Detection | null;
+
+  /** Private provider correlation only. Never exposed in camera snapshots or SSE. */
+  personEventIdentity: string | null;
+
+  /** Private ownership of a button press; separate from preceding person detections. */
+  doorbellEventIdentity: string | null;
+  snapshot: SnapshotInfo | null;
+  eventImage: SnapshotInfo | null;
+  streamState: StreamState;
+  streamViewers: number;
+  streamStartedAt: string | null;
+  streamLastError: string | null;
+}
+
+/**
+ * In-memory source of truth for camera state and lifecycle events.
+ *
+ * The class owns no network resources. Callers register identities, report
+ * provider observations, and subscribe to the `event` EventEmitter channel.
+ * Detection flags are cleared after the configured hold period unless a newer
+ * provider notification refreshes them.
+ */
+export class GatewayState extends EventEmitter {
+  readonly #cameras = new Map<string, MutableCameraState>();
+  readonly #stations = new Map<string, HomeBaseState>();
+  readonly #sensors = new Map<string, SecuritySensorState>();
+  readonly #locks = new Map<string, SmartLockState>();
+  readonly #pushDiagnostics: PushDiagnostic[] = [];
+  #eventDeliveryDiagnostic: EventDeliveryDiagnostic = {
+    receiverState: "stopped",
+    connectionCount: 0,
+    disconnectionCount: 0,
+    deliveryCount: 0,
+    parsedCount: 0,
+    emptyCount: 0,
+    unparsedCount: 0,
+    lastDeliveryAge: "none",
+  };
+  #lastEventDeliveryAtMilliseconds: number | null = null;
+  readonly #motionClearTimers = new Map<string, NodeJS.Timeout>();
+  readonly #personClearTimers = new Map<string, NodeJS.Timeout>();
+  readonly #doorbellClearTimers = new Map<string, NodeJS.Timeout>();
+  readonly #detectionClearTimers = new Map<string, NodeJS.Timeout>();
+  readonly #sensorMotionClearTimers = new Map<string, NodeJS.Timeout>();
+  readonly #sensorDetectionClearTimers = new Map<string, NodeJS.Timeout>();
+  #inventoryDiagnostics: InventoryDiagnostic[] = [];
+  #cameraCapabilities: CameraCapabilityManifest[] = [];
+  #deviceCapabilities: DeviceCapabilityManifest[] = [];
+  #connectionState: ConnectionState = "starting";
+  #connectionDetail: string | null = null;
+
+  /** Create state with a short hold period for transient detection flags. */
+  constructor(private readonly detectionHoldMilliseconds = 10_000) {
+    super();
+  }
+
+  /** Replace lock inventory atomically so removed bindings cannot remain actionable. */
+  replaceLocks(locks: readonly SmartLockState[]): void {
+    this.#locks.clear();
+    for (const lock of locks) this.#locks.set(lock.serial, structuredClone(lock));
+    this.emit("event", { type: "locks", locks: this.listLocks() } satisfies GatewayEvent);
+  }
+
+  /** Return cached lock observations only, with expired observations marked unavailable. */
+  listLocks(): SmartLockState[] {
+    return [...this.#locks.values()].map(lock => maskSmartLockState(lock));
+  }
+
+  /** Check normalized lock existence without consulting the network. */
+  hasLock(serial: string): boolean { return this.#locks.has(serial); }
+
+  /** Add a camera or refresh its discovered metadata and return its state. */
+  registerCamera(identity: CameraIdentity): CameraState {
+    const existing = this.#cameras.get(identity.serial);
+    if (existing) {
+      if (existing.identity.stationSerial !== identity.stationSerial || existing.identity.model !== identity.model) {
+        existing.personEventIdentity = null;
+        existing.doorbellEventIdentity = null;
+      }
+      existing.identity = identity;
+    } else {
+      this.#cameras.set(identity.serial, {
+        identity,
+        rawMotionDetected: false,
+        motionDetected: false,
+        personDetected: false,
+        strangerDetected: false,
+        petDetected: false,
+        vehicleDetected: false,
+        dogDetected: false,
+        cryingDetected: false,
+        soundDetected: false,
+        packageDeliveredDetected: false,
+        packageTakenDetected: false,
+        packageStrandedDetected: false,
+        doorbellPressed: false,
+        lastDetection: null,
+        personEventIdentity: null,
+        doorbellEventIdentity: null,
+        snapshot: null,
+        eventImage: null,
+        streamState: "idle",
+        streamViewers: 0,
+        streamStartedAt: null,
+        streamLastError: null,
+      });
+    }
+    return this.#emitCamera(identity.serial);
+  }
+
+  /** Add or replace one complete HomeBase state observation. */
+  registerStation(station: HomeBaseState): HomeBaseState {
+    const snapshot = structuredClone(station);
+    this.#stations.set(station.serial, snapshot);
+    this.emit("event", { type: "station-updated", station: snapshot } satisfies GatewayEvent);
+    return structuredClone(snapshot);
+  }
+
+  /** Add or replace one standalone security-sensor observation. */
+  registerSensor(sensor: SecuritySensorState): SecuritySensorState {
+    const existing = this.#sensors.get(sensor.serial);
+    const capabilities = new Set(sensor.capabilities);
+    for (const kind of e21DetectionKinds) {
+      if (capabilities.has(kind)) continue;
+      const key = `${sensor.serial}:${kind}`;
+      const timer = this.#sensorDetectionClearTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.#sensorDetectionClearTimers.delete(key);
+    }
+    const notifications: Partial<Record<`${E21DetectionKind}Detected`, boolean>> = {};
+    for (const kind of e21DetectionKinds) {
+      const field = `${kind}Detected` as const;
+      if (capabilities.has(kind)) notifications[field] = existing?.[field] ?? sensor[field] ?? false;
+    }
+    const snapshot = structuredClone({ ...sensor, motionDetected: existing?.motionDetected ?? sensor.motionDetected, ...notifications });
+    for (const kind of e21DetectionKinds) {
+      if (capabilities.has(kind)) continue;
+      if (kind === "motion") snapshot.motionDetected = false;
+      else delete snapshot[`${kind}Detected`];
+    }
+    this.#sensors.set(sensor.serial, snapshot);
+    this.emit("event", { type: "sensor-updated", sensor: snapshot } satisfies GatewayEvent);
+    return structuredClone(snapshot);
+  }
+
+  /** Return immutable snapshots for every supported standalone sensor. */
+  listSensors(): SecuritySensorState[] {
+    return [...this.#sensors.values()].map((sensor) => structuredClone(sensor));
+  }
+
+  /** Check standalone sensor existence without throwing. */
+  hasSensor(serial: string): boolean {
+    return this.#sensors.has(serial);
+  }
+
+  /** Apply a settled contact state delivered by cloud inventory or push. */
+  updateSensorContact(serial: string, open: boolean): void {
+    const sensor = this.#sensors.get(serial);
+    if (!sensor || !sensor.capabilities.includes("contact")) return;
+    this.registerSensor({ ...sensor, contactOpen: open });
+  }
+
+  /** Hold a standalone PIR event long enough for Home Assistant to observe it. */
+  recordSensorMotion(serial: string, detected: boolean): void {
+    const sensor = this.#sensors.get(serial);
+    if (!sensor || !sensor.capabilities.includes("motion")) return;
+    const existing = this.#sensorMotionClearTimers.get(serial);
+    if (existing) clearTimeout(existing);
+    this.#sensorMotionClearTimers.delete(serial);
+    this.#sensors.set(serial, { ...sensor, motionDetected: detected });
+    this.emit("event", { type: "sensor-updated", sensor: this.#sensors.get(serial)! } satisfies GatewayEvent);
+    if (!detected) return;
+    const timer = setTimeout(() => {
+      this.#sensorMotionClearTimers.delete(serial);
+      this.recordSensorMotion(serial, false);
+    }, this.detectionHoldMilliseconds);
+    timer.unref();
+    this.#sensorMotionClearTimers.set(serial, timer);
+  }
+
+  /** Hold one passive care notification independently for the configured event window. */
+  recordSensorDetection(serial: string, kind: E21DetectionKind, detected: boolean): void {
+    const sensor = this.#sensors.get(serial);
+    if (!sensor || !sensor.capabilities.includes(kind)) return;
+    const key = `${serial}:${kind}`;
+    const existing = this.#sensorDetectionClearTimers.get(key);
+    if (existing) clearTimeout(existing);
+    this.#sensorDetectionClearTimers.delete(key);
+    const field = `${kind}Detected` as const;
+    const snapshot = structuredClone({ ...sensor, [field]: detected });
+    this.#sensors.set(serial, snapshot);
+    this.emit("event", { type: "sensor-updated", sensor: structuredClone(snapshot) } satisfies GatewayEvent);
+    if (!detected) return;
+    const timer = setTimeout(() => {
+      this.#sensorDetectionClearTimers.delete(key);
+      this.recordSensorDetection(serial, kind, false);
+    }, this.detectionHoldMilliseconds);
+    timer.unref();
+    this.#sensorDetectionClearTimers.set(key, timer);
+  }
+
+  /** Return immutable snapshots for every known HomeBase. */
+  listStations(): HomeBaseState[] {
+    return [...this.#stations.values()].map((station) => structuredClone(station));
+  }
+
+  /** Return one HomeBase or throw when its serial is not known. */
+  getStation(serial: string): HomeBaseState {
+    const station = this.#stations.get(serial);
+    if (!station) throw new Error(`Unknown HomeBase: ${serial}`);
+    return structuredClone(station);
+  }
+
+  /** Check HomeBase existence without throwing. */
+  hasStation(serial: string): boolean {
+    return this.#stations.has(serial);
+  }
+
+  /** Restore persisted image metadata without emitting a detection event. */
+  restoreSnapshot(serial: string, snapshot: SnapshotInfo): void {
+    const camera = this.#requireCamera(serial);
+    camera.snapshot = snapshot;
+    this.#emitCamera(serial);
+  }
+
+  /** Restore persisted event-image metadata without emitting a detection event. */
+  restoreEventImage(serial: string, eventImage: SnapshotInfo): void {
+    const camera = this.#requireCamera(serial);
+    camera.eventImage = eventImage;
+    this.#emitCamera(serial);
+  }
+
+  /** Record motion and hold the visible flag long enough for HA to observe it. */
+  recordMotion(serial: string, detected: boolean, occurredAt = new Date()): void {
+    const camera = this.#requireCamera(serial);
+    camera.rawMotionDetected = detected;
+    this.#refreshAggregateMotion(camera);
+    this.#scheduleDetectionClear(this.#motionClearTimers, serial, detected, () => this.recordMotion(serial, false));
+    if (detected) {
+      const detection: Detection = {
+        id: randomUUID(),
+        kind: "motion",
+        occurredAt: occurredAt.toISOString(),
+        personName: null,
+        recognized: false,
+      };
+      if (!isRecentPersonDetection(camera.lastDetection, occurredAt)) camera.lastDetection = detection;
+      this.emit("event", { type: "detection", cameraSerial: serial, detection } satisfies GatewayEvent);
+    }
+    this.#emitCamera(serial);
+  }
+
+  /** Record person recognition and retain optional source ownership for later name enrichment. */
+  recordPerson(serial: string, detected: boolean, personName: string | null, occurredAt = new Date(), eventIdentity: string | null = null): void {
+    const camera = this.#requireCamera(serial);
+    camera.personDetected = detected;
+    this.#refreshAggregateMotion(camera);
+    this.#scheduleDetectionClear(this.#personClearTimers, serial, detected, () => this.recordPerson(serial, false, null));
+    if (detected) {
+      camera.personEventIdentity = eventIdentity;
+      const normalizedName = normalizePersonName(personName);
+      const detection: Detection = {
+        id: randomUUID(),
+        kind: "person",
+        occurredAt: occurredAt.toISOString(),
+        personName: normalizedName,
+        recognized: normalizedName !== null,
+      };
+      camera.lastDetection = detection;
+      this.emit("event", { type: "detection", cameraSerial: serial, detection } satisfies GatewayEvent);
+    }
+    this.#emitCamera(serial);
+  }
+
+  /**
+   * Add the first recognized name to the matching last person detection.
+   * Preserve its identity, time and expired detection flags. A newer event,
+   * changed camera binding or an existing name refuses the update. This emits
+   * camera state only, so subscribers do not receive a second detection.
+   */
+  enrichPersonName(serial: string, eventIdentity: string, personName: string): void {
+    this.#enrichName(serial, eventIdentity, personName, "person");
+  }
+
+  /** Enrich only the same unnamed button press, preserving its time, pulse and event identity. */
+  enrichDoorbellName(serial: string, eventIdentity: string, personName: string): void {
+    this.#enrichName(serial, eventIdentity, personName, "doorbell");
+  }
+
+  /** Publish recognition state only after the matching detection still owns its source identity. */
+  #enrichName(serial: string, eventIdentity: string, personName: string, kind: "person" | "doorbell"): void {
+    const camera = this.#requireCamera(serial), previous = camera.lastDetection;
+    const name = normalizePersonName(personName);
+    const owner = kind === "person" ? camera.personEventIdentity : camera.doorbellEventIdentity;
+    if (!eventIdentity || owner !== eventIdentity || !name
+      || previous?.kind !== kind || previous.recognized) return;
+    camera.lastDetection = { ...previous, personName: name, recognized: true };
+    this.#emitCamera(serial);
+  }
+
+  /** Record a non-person AI or audio detection without collapsing its meaning into motion. */
+  recordDetection(
+    serial: string,
+    kind: Exclude<DetectionKind, "motion" | "person" | "doorbell">,
+    detected: boolean,
+    occurredAt = new Date(),
+  ): void {
+    const camera = this.#requireCamera(serial);
+    const field = `${kind}Detected` as keyof Pick<MutableCameraState, "strangerDetected" | "petDetected" | "vehicleDetected" | "dogDetected" | "cryingDetected" | "soundDetected" | "packageDeliveredDetected" | "packageTakenDetected" | "packageStrandedDetected">;
+    camera[field] = detected;
+    if (kind !== "crying" && kind !== "sound") this.#refreshAggregateMotion(camera);
+    const timerKey = `${serial}:${kind}`;
+    const previous = this.#detectionClearTimers.get(timerKey);
+    if (previous) clearTimeout(previous);
+    this.#detectionClearTimers.delete(timerKey);
+    if (detected) {
+      const detection: Detection = {
+        id: randomUUID(), kind, occurredAt: occurredAt.toISOString(), personName: null, recognized: false,
+      };
+      camera.lastDetection = detection;
+      this.emit("event", { type: "detection", cameraSerial: serial, detection } satisfies GatewayEvent);
+      const timer = setTimeout(() => {
+        this.#detectionClearTimers.delete(timerKey);
+        this.recordDetection(serial, kind, false);
+      }, this.detectionHoldMilliseconds);
+      timer.unref();
+      this.#detectionClearTimers.set(timerKey, timer);
+    }
+    this.#emitCamera(serial);
+  }
+
+  /**
+   * Record a button press and recognition explicitly supplied by that press.
+   * A source-owned press replaces older recognition context. Legacy callers
+   * without context retain their existing last-person behaviour. No person or
+   * motion pulse is manufactured, and clear callbacks retain ownership for a
+   * later exact-identity name update.
+   */
+  recordDoorbell(
+    serial: string,
+    pressed: boolean,
+    occurredAt = new Date(),
+    personName: string | null = null,
+    eventIdentity: string | null = null,
+  ): void {
+    const camera = this.#requireCamera(serial);
+    if (!camera.identity.doorbellSupported) return;
+    camera.doorbellPressed = pressed;
+    this.#scheduleDetectionClear(this.#doorbellClearTimers, serial, pressed, () => this.recordDoorbell(serial, false));
+    if (pressed) {
+      camera.doorbellEventIdentity = eventIdentity;
+      const name = normalizePersonName(personName);
+      const detection: Detection = {
+        id: randomUUID(),
+        kind: "doorbell",
+        occurredAt: occurredAt.toISOString(),
+        personName: name,
+        recognized: name !== null,
+      };
+      if (eventIdentity !== null || name !== null || camera.lastDetection?.recognized !== true) camera.lastDetection = detection;
+      this.emit("event", { type: "detection", cameraSerial: serial, detection } satisfies GatewayEvent);
+    }
+    this.#emitCamera(serial);
+  }
+
+  /** Publish new retained-image metadata and notify SSE subscribers. */
+  updateSnapshot(serial: string, snapshot: SnapshotInfo): void {
+    const camera = this.#requireCamera(serial);
+    camera.snapshot = snapshot;
+    this.emit("event", { type: "snapshot-updated", cameraSerial: serial, snapshot } satisfies GatewayEvent);
+    this.#emitCamera(serial);
+  }
+
+  /** Publish new event-image metadata and notify SSE subscribers. */
+  updateEventImage(serial: string, eventImage: SnapshotInfo): void {
+    const camera = this.#requireCamera(serial);
+    camera.eventImage = eventImage;
+    this.emit("event", { type: "event-image-updated", cameraSerial: serial, eventImage } satisfies GatewayEvent);
+    this.#emitCamera(serial);
+  }
+
+  /** Update shared stream lifecycle and viewer count for one camera. */
+  updateStream(serial: string, state: StreamState, viewers: number, error: string | null = null): void {
+    const camera = this.#requireCamera(serial);
+    camera.streamState = state;
+    camera.streamViewers = viewers;
+    camera.streamLastError = error;
+    if (state === "streaming" && camera.streamStartedAt === null) {
+      camera.streamStartedAt = new Date().toISOString();
+    } else if (state === "idle" || state === "error") {
+      camera.streamStartedAt = null;
+    }
+    this.#emitCamera(serial);
+  }
+
+  /** Publish provider connectivity and an optional safe diagnostic message. */
+  updateConnection(state: ConnectionState, detail: string | null = null): void {
+    this.#connectionState = state;
+    this.#connectionDetail = detail;
+    this.emit("event", { type: "connection-updated", state, detail } satisfies GatewayEvent);
+  }
+
+  /** Return the latest provider connection state for health and UI pages. */
+  getConnection(): { state: ConnectionState; detail: string | null } {
+    return { state: this.#connectionState, detail: this.#connectionDetail };
+  }
+
+  /** Keep a bounded diagnostic history without retaining raw push payloads. */
+  recordPushDiagnostic(diagnostic: PushDiagnostic): void {
+    this.#pushDiagnostics.push(diagnostic);
+    if (this.#pushDiagnostics.length > 50) this.#pushDiagnostics.shift();
+  }
+
+  /** Return a copy of the bounded push diagnostic history. */
+  listPushDiagnostics(): PushDiagnostic[] {
+    return [...this.#pushDiagnostics];
+  }
+
+  /** Record receiver lifecycle without retaining connection or account data. */
+  recordEventReceiverState(state: EventReceiverState): void {
+    this.#eventDeliveryDiagnostic = {
+      ...this.#eventDeliveryDiagnostic,
+      receiverState: state,
+      connectionCount: this.#eventDeliveryDiagnostic.connectionCount + (state === "connected" ? 1 : 0),
+      disconnectionCount: this.#eventDeliveryDiagnostic.disconnectionCount + (state === "disconnected" ? 1 : 0),
+    };
+  }
+
+  /** Count one raw Firebase delivery by parse outcome without retaining its payload. */
+  recordEventDelivery(outcome: "parsed" | "empty" | "unparsed", receivedAtMilliseconds = Date.now()): void {
+    this.#lastEventDeliveryAtMilliseconds = receivedAtMilliseconds;
+    this.#eventDeliveryDiagnostic = {
+      ...this.#eventDeliveryDiagnostic,
+      deliveryCount: this.#eventDeliveryDiagnostic.deliveryCount + 1,
+      parsedCount: this.#eventDeliveryDiagnostic.parsedCount + (outcome === "parsed" ? 1 : 0),
+      emptyCount: this.#eventDeliveryDiagnostic.emptyCount + (outcome === "empty" ? 1 : 0),
+      unparsedCount: this.#eventDeliveryDiagnostic.unparsedCount + (outcome === "unparsed" ? 1 : 0),
+      lastDeliveryAge: "under_one_minute",
+    };
+  }
+
+  /** Return a copy of process-lifetime event-delivery counters. */
+  eventDeliveryDiagnostic(nowMilliseconds = Date.now()): EventDeliveryDiagnostic {
+    const elapsed = this.#lastEventDeliveryAtMilliseconds === null
+      ? null
+      : Math.max(0, nowMilliseconds - this.#lastEventDeliveryAtMilliseconds);
+    const lastDeliveryAge = elapsed === null
+      ? "none"
+      : elapsed < 60_000 ? "under_one_minute"
+      : elapsed < 5 * 60_000 ? "one_to_five_minutes"
+      : elapsed < 30 * 60_000 ? "five_to_thirty_minutes"
+      : "over_thirty_minutes";
+    return { ...this.#eventDeliveryDiagnostic, lastDeliveryAge };
+  }
+
+  /** Replace the current inventory explanation after provider discovery. */
+  updateInventoryDiagnostics(diagnostics: InventoryDiagnostic[]): void {
+    this.#inventoryDiagnostics = [...diagnostics];
+  }
+
+  /** Return a copy of the latest inventory diagnostics. */
+  listInventoryDiagnostics(): InventoryDiagnostic[] {
+    return [...this.#inventoryDiagnostics];
+  }
+
+  /** Replace per-device camera shapes after one complete Mega inventory read. */
+  updateCameraCapabilities(manifests: readonly CameraCapabilityManifest[]): void {
+    this.#cameraCapabilities = manifests.map((manifest) => structuredClone(manifest));
+  }
+
+  /** Return checked camera support shapes without querying a device. */
+  listCameraCapabilities(): CameraCapabilityManifest[] {
+    return this.#cameraCapabilities.map((manifest) => structuredClone(manifest));
+  }
+
+  /** Replace baseline product-family decisions after one complete inventory read. */
+  updateDeviceCapabilities(manifests: readonly DeviceCapabilityManifest[]): void {
+    this.#deviceCapabilities = manifests.map((manifest) => structuredClone(manifest));
+  }
+
+  /** Return independent copies of non-camera family decisions. */
+  listDeviceCapabilities(): DeviceCapabilityManifest[] {
+    return this.#deviceCapabilities.map((manifest) => structuredClone(manifest));
+  }
+
+  /** Build a support attachment without serials, names, payloads, or account data. */
+  catalogueEvidence(): CatalogueEvidence {
+    const inventoryBySerial = new Map(this.#inventoryDiagnostics.map((device) => [device.serial, device]));
+    return {
+      schema: 1,
+      inventory: this.#inventoryDiagnostics.map(({ serial: _serial, name: _name, ...device }) => structuredClone(device)),
+      cameras: this.#cameraCapabilities.map(({ serial: _serial, ...camera }) => structuredClone(camera)),
+      devices: this.#deviceCapabilities.map(({ serial: _serial, ...device }) => structuredClone(device)),
+      events: this.#pushDiagnostics.map(({ receivedAt, cameraSerial, cameraName: _cameraName, personName: _personName, ...event }) => {
+        const inventory = inventoryBySerial.get(cameraSerial);
+        return {
+          ...structuredClone(event),
+          observedOn: receivedAt.slice(0, 10),
+          model: inventory?.model ?? "unknown",
+          deviceType: inventory?.megaDeviceType ?? null,
+        };
+      }),
+    };
+  }
+
+  /** Return immutable snapshots for every known camera. */
+  listCameras(): CameraState[] {
+    return [...this.#cameras.keys()].map((serial) => this.getCamera(serial));
+  }
+
+  /** Return one camera or throw when the serial is not known. */
+  getCamera(serial: string): CameraState {
+    const camera = this.#requireCamera(serial);
+    return {
+      serial: camera.identity.serial,
+      name: camera.identity.name,
+      model: camera.identity.model,
+      firmware: camera.identity.firmware ?? null,
+      hardwareVersion: camera.identity.hardwareVersion ?? null,
+      firmwareSubVersion: camera.identity.firmwareSubVersion ?? null,
+      firmwareUpdateAvailable: camera.identity.firmwareUpdateAvailable ?? null,
+      rssi: camera.identity.rssi ?? null,
+      audioSettings: camera.identity.audioSettings ?? null,
+      streamingQualityControlSupported: camera.identity.streamingQualityControlSupported ?? false,
+      streamingQualityModes: camera.identity.streamingQualityControlSupported ? camera.identity.streamingQualityModes ?? [] : [],
+      nvrPanControlSupported: camera.identity.nvrPanControlSupported ?? false,
+      nvrOpticalZoomControlSupported: camera.identity.nvrOpticalZoomControlSupported ?? false,
+      nvrViewOptions: camera.identity.nvrViewOptions ?? [],
+      nvrSelectedView: camera.identity.nvrSelectedView ?? null,
+      nvrLiveControlsSupported: camera.identity.nvrLiveControlsSupported ?? false,
+      hlsIdleHandoverSupported: camera.identity.hlsIdleHandoverSupported ?? false,
+      preferenceControls: camera.identity.preferenceControls ?? [],
+      preferenceRanges: camera.identity.preferenceRanges ?? {},
+      carePreferences: camera.identity.carePreferences ?? {},
+      careMonitor: camera.identity.careMonitor ?? false,
+      ...(camera.identity.supportedDetections !== undefined ? { supportedDetections: camera.identity.supportedDetections } : {}),
+      motionSensitivityControlSupported: camera.identity.motionSensitivityControlSupported ?? false,
+      motionSensitivitySteps: camera.identity.motionSensitivitySteps ?? null,
+      homebaseChimeControlSupported: camera.identity.homebaseChimeControlSupported ?? false,
+      lightBrightnessControlSupported: camera.identity.lightBrightnessControlSupported ?? false,
+      manualFloodlightControlSupported: camera.identity.manualFloodlightControlSupported ?? false,
+      audioRecordingControlSupported: camera.identity.audioRecordingControlSupported ?? false,
+      reportedSettings: camera.identity.reportedSettings ?? null,
+      catalogueStatus: camera.identity.catalogueStatus ?? null,
+      stationSerial: camera.identity.stationSerial,
+      streamSupported: camera.identity.streamSupported,
+      liveAudioSupported: camera.identity.liveAudioSupported ?? false,
+      talkbackSupported: camera.identity.talkbackSupported ?? false,
+      storedRecordingsSupported: camera.identity.storedRecordingsSupported ?? false,
+      doorbellSupported: camera.identity.doorbellSupported,
+      enabled: camera.identity.enabled ?? null,
+      enableControlSupported: camera.identity.enableControlSupported ?? false,
+      motionDetectionEnabled: camera.identity.motionDetectionEnabled ?? null,
+      motionDetectionControlSupported: camera.identity.motionDetectionControlSupported ?? false,
+      guardMode: camera.identity.guardMode ?? null,
+      guardModeControlSupported: camera.identity.guardModeControlSupported ?? false,
+      guardModeRefreshSupported: camera.identity.guardModeRefreshSupported ?? false,
+      nightVisionMode: camera.identity.nightVisionMode ?? null,
+      nightVisionModes: camera.identity.nightVisionModes ?? [],
+      nightVisionControlSupported: camera.identity.nightVisionControlSupported ?? false,
+      autoNightVisionEnabled: camera.identity.autoNightVisionEnabled ?? null,
+      autoNightVisionControlSupported: camera.identity.autoNightVisionControlSupported ?? false,
+      cameraLightControlSupported: camera.identity.cameraLightControlSupported ?? false,
+      experimentalLightControlSupported: camera.identity.experimentalLightControlSupported ?? false,
+      directionalPanControlSupported: camera.identity.directionalPanControlSupported ?? false,
+      timedLightControlSupported: camera.identity.timedLightControlSupported ?? false,
+      cameraSirenControlSupported: camera.identity.cameraSirenControlSupported ?? false,
+      presetPositionControlSupported: camera.identity.presetPositionControlSupported ?? false,
+      aiTrackingControlSupported: camera.identity.aiTrackingControlSupported ?? false,
+      aiTrackingEnabled: camera.identity.aiTrackingEnabled ?? null,
+      autoCruiseControlSupported: camera.identity.autoCruiseControlSupported ?? false,
+      motionDetected: camera.motionDetected,
+      personDetected: camera.personDetected,
+      strangerDetected: camera.strangerDetected,
+      petDetected: camera.petDetected,
+      vehicleDetected: camera.vehicleDetected,
+      dogDetected: camera.dogDetected,
+      cryingDetected: camera.cryingDetected,
+      soundDetected: camera.soundDetected,
+      packageDeliveredDetected: camera.packageDeliveredDetected,
+      packageTakenDetected: camera.packageTakenDetected,
+      packageStrandedDetected: camera.packageStrandedDetected,
+      doorbellPressed: camera.doorbellPressed,
+      battery: camera.identity.battery ?? null,
+      lastDetection: camera.lastDetection,
+      snapshot: camera.snapshot,
+      eventImage: camera.eventImage,
+      stream: {
+        state: camera.streamState,
+        viewers: camera.streamViewers,
+        startedAt: camera.streamStartedAt,
+        lastError: camera.streamLastError,
+      },
+    };
+  }
+
+  /** Check camera existence without throwing. */
+  hasCamera(serial: string): boolean {
+    return this.#cameras.has(serial);
+  }
+
+  /** Cancel pending detection timers during process shutdown. */
+  close(): void {
+    for (const timer of this.#motionClearTimers.values()) clearTimeout(timer);
+    for (const timer of this.#personClearTimers.values()) clearTimeout(timer);
+    for (const timer of this.#doorbellClearTimers.values()) clearTimeout(timer);
+    for (const timer of this.#detectionClearTimers.values()) clearTimeout(timer);
+    for (const timer of this.#sensorMotionClearTimers.values()) clearTimeout(timer);
+    for (const timer of this.#sensorDetectionClearTimers.values()) clearTimeout(timer);
+    this.#motionClearTimers.clear();
+    this.#personClearTimers.clear();
+    this.#doorbellClearTimers.clear();
+    this.#detectionClearTimers.clear();
+    this.#sensorMotionClearTimers.clear();
+    this.#sensorDetectionClearTimers.clear();
+  }
+
+  /** Keep the general motion flag active while any visual detection is active. */
+  #refreshAggregateMotion(camera: MutableCameraState): void {
+    camera.motionDetected =
+      camera.rawMotionDetected ||
+      camera.personDetected ||
+      camera.strangerDetected ||
+      camera.petDetected ||
+      camera.vehicleDetected ||
+      camera.dogDetected ||
+      camera.packageDeliveredDetected ||
+      camera.packageTakenDetected ||
+      camera.packageStrandedDetected;
+  }
+
+  #scheduleDetectionClear(
+    timers: Map<string, NodeJS.Timeout>,
+    serial: string,
+    detected: boolean,
+    clear: () => void,
+  ): void {
+    const existing = timers.get(serial);
+    if (existing) clearTimeout(existing);
+    timers.delete(serial);
+    if (!detected) return;
+
+    const timer = setTimeout(() => {
+      timers.delete(serial);
+      clear();
+    }, this.detectionHoldMilliseconds);
+    timer.unref();
+    timers.set(serial, timer);
+  }
+
+  #requireCamera(serial: string): MutableCameraState {
+    const camera = this.#cameras.get(serial);
+    if (!camera) throw new Error(`Unknown camera: ${serial}`);
+    return camera;
+  }
+
+  #emitCamera(serial: string): CameraState {
+    const camera = this.getCamera(serial);
+    this.emit("event", { type: "camera-updated", camera } satisfies GatewayEvent);
+    return camera;
+  }
+}
+
+function isRecentPersonDetection(detection: Detection | null, occurredAt: Date): boolean {
+  if (detection?.kind !== "person") return false;
+  const ageMilliseconds = occurredAt.getTime() - new Date(detection.occurredAt).getTime();
+  return ageMilliseconds >= 0 && ageMilliseconds <= 10_000;
+}
+
+/** Convert Eufy's placeholder person labels into a nullable name. */
+export function normalizePersonName(value: string | null | undefined): string | null {
+  const candidate = value?.trim();
+  if (!candidate || /^(unknown|unknown person|no person)$/i.test(candidate)) return null;
+  return candidate;
+}

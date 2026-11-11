@@ -1,0 +1,77 @@
+name: Eufy Mega Security (experimental build)
+version: "0.1.259-e10x3"
+slug: eufy_event_gateway_e10x
+description: Experimental build of eufy-mega-security with an optional E10 call-rollover option (off by default)
+url: https://github.com/mcpannett/ha-addons-local
+startup: application
+boot: manual
+init: false
+arch:
+  - aarch64
+  - amd64
+ports:
+  3218/tcp: null
+ports_description:
+  3218/tcp: Gateway API
+watchdog: http://[HOST]:[PORT:3218]/live
+ingress: true
+ingress_port: 3218
+panel_icon: mdi:cctv
+host_network: true
+hassio_api: true
+discovery:
+  - eufy_event_gateway
+options:
+  username: ""
+  password: ""
+  country: AU
+  verification_code: ""
+  experimental_event_image_request: false
+  experimental_homebase_event_images: false
+  experimental_homebase_event_names: false
+  raw_message_history: false
+  capture_failed_event_images: false
+  experimental_model_controls: false
+  experimental_e30_locks: false
+  experimental_nvr_controls: false
+  experimental_nvr_live: false
+  experimental_t8420_live: false
+  experimental_nvr_mode_observer: false
+  experimental_doorbell_rtc: false
+  experimental_general_rtc: false
+  experimental_cloud_recordings: false
+  experimental_nvr_region: auto
+  experimental_fixed_h265_resolution: false
+  experimental_low_cpu_h265_conversion: false
+  experimental_s340_smooth_live: false
+  experimental_e10_signal_tolerance: "off"
+  experimental_e10_signal_grace_ms: 3000
+  experimental_e10_call_rollover_lead_s: 0
+  experimental_e10_call_limit_s: 300
+schema:
+  username: str
+  password: password
+  country: str
+  verification_code: str
+  experimental_event_image_request: bool?
+  experimental_homebase_event_images: bool?
+  experimental_homebase_event_names: bool?
+  raw_message_history: bool?
+  capture_failed_event_images: bool
+  experimental_model_controls: bool
+  experimental_e30_locks: bool?
+  experimental_nvr_controls: bool?
+  experimental_nvr_live: bool
+  experimental_t8420_live: bool
+  experimental_nvr_mode_observer: bool?
+  experimental_doorbell_rtc: bool
+  experimental_general_rtc: bool?
+  experimental_cloud_recordings: bool
+  experimental_nvr_region: list(auto|us|eu|ie)
+  experimental_fixed_h265_resolution: bool?
+  experimental_low_cpu_h265_conversion: bool?
+  experimental_s340_smooth_live: bool?
+  experimental_e10_signal_tolerance: list(off|log|tolerate)?
+  experimental_e10_signal_grace_ms: int(1000,60000)?
+  experimental_e10_call_rollover_lead_s: int(0,120)?
+  experimental_e10_call_limit_s: int(60,900)?
