@@ -40,6 +40,11 @@ export EUFY_GATEWAY_EXPERIMENTAL_E10_SIGNAL_TOLERANCE="$(jq -r '.experimental_e1
 export EUFY_GATEWAY_EXPERIMENTAL_E10_SIGNAL_GRACE_MS="$(jq -r '.experimental_e10_signal_grace_ms // 3000' "$options")"
 export EUFY_GATEWAY_EXPERIMENTAL_E10_CALL_ROLLOVER_LEAD_S="$(jq -r '.experimental_e10_call_rollover_lead_s // 0' "$options")"
 export EUFY_GATEWAY_EXPERIMENTAL_E10_CALL_LIMIT_S="$(jq -r '.experimental_e10_call_limit_s // 300' "$options")"
+# LOCAL EXPERIMENT 0004: sequential | overlap (default sequential), post-rollover health guard (default true),
+# and the existing source stop grace (EUFY_GATEWAY_STREAM_GRACE_SECONDS, upstream default 10 s).
+export EUFY_GATEWAY_EXPERIMENTAL_E10_ROLLOVER_MODE="$(jq -r '.experimental_e10_rollover_mode // "sequential"' "$options")"
+export EUFY_GATEWAY_EXPERIMENTAL_E10_HEALTH_GUARD="$(jq -r 'if .experimental_e10_health_guard == false then "false" else "true" end' "$options")"
+export EUFY_GATEWAY_STREAM_GRACE_SECONDS="$(jq -r '.experimental_stream_grace_s // 10' "$options")"
 if [ ! -s "$token_file" ]; then
   umask 077
   token_tmp="${token_file}.tmp"

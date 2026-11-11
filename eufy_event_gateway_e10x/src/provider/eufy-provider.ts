@@ -104,6 +104,11 @@ const E10_ROLLOVER_LEAD_MS = ((value): number => Number.isInteger(value) && valu
 /** LOCAL EXPERIMENT: the service's per-call limit in seconds, 60..900, default 300. */
 const E10_CALL_LIMIT_MS = ((value): number => Number.isInteger(value) && value >= 60 && value <= 900 ? value * 1000 : 300_000)(
   Number(process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_CALL_LIMIT_S));
+/** LOCAL EXPERIMENT 0004: E10 rollover mode, "sequential" (default, never two calls) or "overlap" (0003 make-before-break). */
+const E10_ROLLOVER_MODE = ((value): "overlap" | "sequential" => value === "overlap" ? "overlap" : "sequential")(
+  process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_ROLLOVER_MODE);
+/** LOCAL EXPERIMENT 0004: replace a degraded post-rollover call (default on; "false" disables). */
+const E10_HEALTH_GUARD = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_HEALTH_GUARD !== "false";
 const knownPushModels = new Set(GENERATED_CATALOGUE_DEVICES.flatMap(device => device.models));
 const DSK_REFRESH_SKEW_MILLISECONDS = 60_000;
 
@@ -2203,6 +2208,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
       if (rolling) {
         const region = this.config.experimentalNvrRegion ?? "auto";
         const source = new E10RollingSession({ leadMilliseconds: E10_ROLLOVER_LEAD_MS, callLimitMilliseconds: E10_CALL_LIMIT_MS,
+          mode: E10_ROLLOVER_MODE, ...(E10_HEALTH_GUARD ? {} : { healthWatchMilliseconds: 0 }),
           signal: entry.controller.signal, ready: (output, codec) => binding.ready(output, codec),
           log: (event, message) => logger.warn(event, message),
           create: async index => {
@@ -2210,7 +2216,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
             if (!binding.current()) throw new NvrTrialError("cancelled");
             return make(await this.#client.nvrSignallingContext(entry.station.serial, region, entry.controller.signal));
           } });
-        logger.info("e10_rollover_enabled", `lead_ms=${E10_ROLLOVER_LEAD_MS} call_limit_ms=${E10_CALL_LIMIT_MS}`);
+        logger.info("e10_rollover_enabled", `lead_ms=${E10_ROLLOVER_LEAD_MS} call_limit_ms=${E10_CALL_LIMIT_MS} mode=${E10_ROLLOVER_MODE} health_guard=${E10_HEALTH_GUARD}`);
         entry.session = source as unknown as NvrRtcSession;
         return entry.session;
       }

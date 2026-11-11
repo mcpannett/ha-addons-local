@@ -53,15 +53,61 @@ export interface E10RolloverOptions {
   readonly ready: (output: PassThrough, codec: () => "h264" | null) => void;
   readonly log?: (event: string, message: string) => void;
   readonly now?: () => number;
+  /**
+   * 0004: "overlap" = make-before-break (two calls for a few seconds, as in 0003).
+   * "sequential" = hang the old call up first, then place the next one (never two
+   * calls on the camera; a short gap, output stays open). Default "overlap".
+   */
+  readonly mode?: "overlap" | "sequential";
+  /** 0004: in sequential mode, wait at most this long for the old call's hang-up before placing the next. Default 2 000. */
+  readonly sequentialCloseWaitMilliseconds?: number;
+  /**
+   * 0004 health guard for a call that became active after a splice or reconnect.
+   * During healthWatchMilliseconds after activation, the call is "degraded" if a
+   * healthWindowMilliseconds window has fewer than healthMinUnits units, or if no
+   * further IDR arrives within healthIdrDeadlineMilliseconds. A degraded call is
+   * hung up and replaced by a fresh call (sequential), and an overlap session
+   * switches to sequential. 0 healthWatchMilliseconds disables the guard.
+   */
+  readonly healthWatchMilliseconds?: number;
+  readonly healthWindowMilliseconds?: number;
+  readonly healthMinUnits?: number;
+  readonly healthIdrDeadlineMilliseconds?: number;
+  /** Stop replacing after this many consecutive degraded calls. Default 3. */
+  readonly maxDegradedReplacements?: number;
+  /** 0004 diagnostics: log value-free per-call windows for this long after activation. Default 60 000 (0 = off). */
+  readonly diagnosticsMilliseconds?: number;
+  readonly diagnosticsWindowMilliseconds?: number;
+}
+
+/** Value-free per-call counters for one diagnostics window. */
+interface CallWindow { units: number; bytes: number; idr: number; maxGapMs: number; lastAt: number | null; nal: Map<number, number> }
+const newWindow = (): CallWindow => ({ units: 0, bytes: 0, idr: 0, maxGapMs: 0, lastAt: null, nal: new Map() });
+
+/** NAL unit types in an Annex-B unit (no payload bytes are kept). */
+export function annexBNalTypes(unit: Buffer): number[] {
+  const types: number[] = [];
+  for (let i = 0; i + 3 < unit.length; i++) {
+    if (unit[i] === 0 && unit[i + 1] === 0 && (unit[i + 2] === 1 || unit[i + 2] === 0 && unit[i + 3] === 1)) {
+      const at = unit[i + 2] === 1 ? i + 3 : i + 4;
+      if (at < unit.length) types.push(unit[at]! & 31);
+      i = at - 1;
+    }
+  }
+  return types;
 }
 
 interface Slot { readonly index: number; readonly call: E10Call; readonly startedAt: number; ended: boolean; closing: boolean; idr: boolean; units: number;
+  /** 0004: activation time, IDR bookkeeping and the current diagnostics/health windows. */
+  activatedAt: number | null; lastIdrAt: number | null; window: CallWindow; health: CallWindow; diagTimer: NodeJS.Timeout | null; healthTimer: NodeJS.Timeout | null;
+  packetsAtWindow: number; recoveriesAtWindow: number;
   /** Units from the latest IDR, received before this call was given a role (bounded). */
   pending: Buffer[] }
 
 export interface E10RolloverStats {
   e10Calls: number; e10Rollovers: number; e10Reconnects: number; e10CallFailures: number;
   e10MaxGapMs: number; e10UnitsOut: number; e10MaxConcurrentCalls: number;
+  e10SequentialRolls: number; e10DegradedCalls: number;
 }
 
 /** True when an Annex-B unit contains an IDR slice (type 5). */
@@ -78,7 +124,8 @@ export function annexBHasIdr(unit: Buffer): boolean {
 
 export class E10RollingSession {
   readonly output = new PassThrough({ highWaterMark: 4 * 1024 * 1024 + 64 });
-  readonly rollover: E10RolloverStats = { e10Calls: 0, e10Rollovers: 0, e10Reconnects: 0, e10CallFailures: 0, e10MaxGapMs: 0, e10UnitsOut: 0, e10MaxConcurrentCalls: 0 };
+  readonly rollover: E10RolloverStats = { e10Calls: 0, e10Rollovers: 0, e10Reconnects: 0, e10CallFailures: 0, e10MaxGapMs: 0, e10UnitsOut: 0, e10MaxConcurrentCalls: 0,
+    e10SequentialRolls: 0, e10DegradedCalls: 0 };
   /** NvrRtcSession compatibility for provider code paths that E10 never admits. */
   readonly switchable = false;
   readonly controlStats = { panData: 0, panReceipts: 0, panAcknowledgedWithoutData: 0, panTimeouts: 0 };
@@ -94,8 +141,11 @@ export class E10RollingSession {
   #retired = false;
   #closing: Promise<void> | null = null;
   #opening = false;
+  #mode: "overlap" | "sequential";
+  #degradedStreak = 0;
 
   constructor(readonly options: E10RolloverOptions) {
+    this.#mode = options.mode === "sequential" ? "sequential" : "overlap";
     options.signal.addEventListener("abort", () => { void this.close(); }, { once: true });
   }
 
@@ -117,7 +167,7 @@ export class E10RollingSession {
   async start(): Promise<void> {
     const slot = await this.#open();
     if (!slot) throw new Error("E10 rollover first call unavailable");
-    this.#activate(slot);
+    this.#activate(slot, "first");
     for (const unit of slot.pending.splice(0)) this.#write(unit);
     this.options.ready(this.output, () => "h264");
   }
@@ -132,7 +182,8 @@ export class E10RollingSession {
     let call: E10Call;
     try { call = await this.options.create(index); }
     catch { this.#opening = false; this.rollover.e10CallFailures++; this.#log("e10_rollover_call_failed", `call=${index} stage=create`); if (index === 0) throw new Error("create"); return null; }
-    const slot: Slot = { index, call, startedAt: this.#now, ended: false, closing: false, idr: false, units: 0, pending: [] };
+    const slot: Slot = { index, call, startedAt: this.#now, ended: false, closing: false, idr: false, units: 0, pending: [],
+      activatedAt: null, lastIdrAt: null, window: newWindow(), health: newWindow(), diagTimer: null, healthTimer: null, packetsAtWindow: 0, recoveriesAtWindow: 0 };
     this.#calls.add(slot);
     this.rollover.e10Calls++;
     this.rollover.e10MaxConcurrentCalls = Math.max(this.rollover.e10MaxConcurrentCalls, this.#calls.size);
@@ -155,12 +206,124 @@ export class E10RollingSession {
     return slot.ended ? null : slot;
   }
 
-  #activate(slot: Slot): void {
+  #activate(slot: Slot, how: "first" | "splice" | "reconnect"): void {
     this.#active = slot; this.#last = slot; this.#retry = 0;
+    slot.activatedAt = this.#now;
     if (this.#timer) clearTimeout(this.#timer);
     const wait = Math.max(0, this.#limit - this.options.leadMilliseconds - (this.#now - slot.startedAt));
-    this.#timer = setTimeout(() => { this.#timer = null; void this.#prepareStandby(); }, wait);
+    this.#timer = setTimeout(() => {
+      this.#timer = null;
+      if (this.#mode === "sequential") void this.#sequentialRoll(); else void this.#prepareStandby();
+    }, wait);
     this.#timer.unref?.();
+    if (how !== "first") { this.#startDiagnostics(slot, how); this.#startHealth(slot); }
+  }
+
+  /** 0004: hang up the active call first, then place the next (no concurrent calls). */
+  async #sequentialRoll(): Promise<void> {
+    const old = this.#active;
+    if (this.#retired || !old || this.#standby) return;
+    this.rollover.e10SequentialRolls++;
+    this.#log("e10_rollover_sequential", `from=${old.index} age_ms=${Math.round(this.#now - old.startedAt)} rolls=${this.rollover.e10SequentialRolls}`);
+    if ((this.options.diagnosticsMilliseconds ?? 60_000) > 0) this.#log("e10_call_window", this.#windowLine(old, "before_sequential"));
+    await this.#retireActive(old);
+    void this.#reconnect();
+  }
+
+  /** Drop the active call without an outage verdict, waiting a bounded time for its hang-up. */
+  async #retireActive(slot: Slot): Promise<void> {
+    if (this.#active === slot) this.#active = null;
+    this.#stopSlotTimers(slot);
+    this.#armOutage();
+    const wait = this.options.sequentialCloseWaitMilliseconds ?? 2_000;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([this.#closeSlot(slot), new Promise<void>(resolve => { timer = setTimeout(resolve, wait); timer.unref?.(); })]);
+    if (timer) clearTimeout(timer);
+  }
+
+  #stopSlotTimers(slot: Slot): void {
+    if (slot.diagTimer) clearInterval(slot.diagTimer);
+    if (slot.healthTimer) clearInterval(slot.healthTimer);
+    slot.diagTimer = slot.healthTimer = null;
+  }
+
+  #stat(slot: Slot, key: string): number {
+    const value = (slot.call.stats as Record<string, unknown>)[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  }
+
+  /** 0004: value-free per-call window line (counts only). */
+  #windowLine(slot: Slot, phase: string): string {
+    const w = slot.window;
+    const nal = [...w.nal.entries()].sort((a, b) => a[0] - b[0]).map(([type, count]) => `${type}:${count}`).join(",") || "none";
+    const packets = this.#stat(slot, "packets"), recoveries = this.#stat(slot, "videoSequenceRecoveries");
+    const line = `call=${slot.index} phase=${phase} age_ms=${Math.round(this.#now - slot.startedAt)} units=${w.units} bytes=${w.bytes} idr=${w.idr}`
+      + ` max_gap_ms=${Math.round(w.maxGapMs)} nal=${nal} packets_delta=${packets - slot.packetsAtWindow} seq_recoveries_delta=${recoveries - slot.recoveriesAtWindow}`
+      + ` concurrent=${this.#calls.size}`;
+    slot.window = newWindow(); slot.packetsAtWindow = packets; slot.recoveriesAtWindow = recoveries;
+    return line;
+  }
+
+  #startDiagnostics(slot: Slot, how: string): void {
+    const total = this.options.diagnosticsMilliseconds ?? 60_000;
+    if (total <= 0) return;
+    const every = Math.max(100, this.options.diagnosticsWindowMilliseconds ?? 10_000);
+    slot.window = newWindow(); slot.packetsAtWindow = this.#stat(slot, "packets"); slot.recoveriesAtWindow = this.#stat(slot, "videoSequenceRecoveries");
+    let elapsed = 0;
+    slot.diagTimer = setInterval(() => {
+      elapsed += every;
+      if (this.#retired || slot.closing) { this.#stopSlotTimers(slot); return; }
+      this.#log("e10_call_window", this.#windowLine(slot, `after_${how}_${Math.round(elapsed / 1000)}s`));
+      if (elapsed >= total && slot.diagTimer) { clearInterval(slot.diagTimer); slot.diagTimer = null; }
+    }, every);
+    slot.diagTimer.unref?.();
+  }
+
+  #startHealth(slot: Slot): void {
+    const watch = this.options.healthWatchMilliseconds ?? 30_000;
+    if (watch <= 0) return;
+    const windowMs = Math.max(100, this.options.healthWindowMilliseconds ?? 5_000);
+    const minUnits = this.options.healthMinUnits ?? 10;
+    const idrDeadline = this.options.healthIdrDeadlineMilliseconds ?? 8_000;
+    const activatedAt = slot.activatedAt ?? this.#now;
+    slot.health = newWindow();
+    let windowStart = activatedAt;
+    const tick = Math.max(50, Math.min(1_000, Math.floor(windowMs / 5)));
+    slot.healthTimer = setInterval(() => {
+      if (this.#retired || slot !== this.#active || slot.closing) { if (slot.healthTimer) clearInterval(slot.healthTimer); slot.healthTimer = null; return; }
+      const now = this.#now;
+      let reason: string | null = null;
+      if (now - windowStart >= windowMs) {
+        if (slot.health.units < minUnits) reason = `low_rate units=${slot.health.units} window_ms=${windowMs}`;
+        slot.health = newWindow(); windowStart = now;
+      }
+      if (!reason && now - activatedAt >= idrDeadline && (slot.lastIdrAt === null || slot.lastIdrAt <= activatedAt)) reason = `no_idr after_ms=${Math.round(now - activatedAt)}`;
+      if (reason) { void this.#degraded(slot, reason); return; }
+      if (now - activatedAt >= watch) {
+        if (slot.healthTimer) clearInterval(slot.healthTimer); slot.healthTimer = null;
+        this.#degradedStreak = 0;
+      }
+    }, tick);
+    slot.healthTimer.unref?.();
+  }
+
+  /** 0004: replace a degraded active call with a fresh call, never two at once. */
+  async #degraded(slot: Slot, reason: string): Promise<void> {
+    if (this.#retired || slot !== this.#active) return;
+    this.#stopSlotTimers(slot);
+    this.rollover.e10DegradedCalls++;
+    this.#degradedStreak++;
+    const limit = this.options.maxDegradedReplacements ?? 3;
+    if (this.#degradedStreak > limit) {
+      this.#log("e10_rollover_degraded_kept", `call=${slot.index} ${reason} streak=${this.#degradedStreak}`);
+      return;
+    }
+    this.#log("e10_rollover_degraded", `${reason} mode=${this.#mode} streak=${this.#degradedStreak} ${this.#windowLine(slot, "degraded")}`);
+    if (this.#mode !== "sequential") { this.#mode = "sequential"; this.#log("e10_rollover_mode", "mode=sequential reason=degraded_after_overlap"); }
+    if (this.#standby) { const standby = this.#standby; this.#standby = null; void this.#closeSlot(standby); }
+    if (this.#timer) { clearTimeout(this.#timer); this.#timer = null; }
+    await this.#retireActive(slot);
+    void this.#reconnect();
   }
 
   async #prepareStandby(): Promise<void> {
@@ -200,8 +363,17 @@ export class E10RollingSession {
   #unit(slot: Slot, unit: Buffer): void {
     if (this.#retired) return;
     slot.units++;
+    const types = annexBNalTypes(unit);
+    const idr = types.includes(5);
+    const now = this.#now;
+    for (const w of [slot.window, slot.health]) {
+      w.units++; w.bytes += unit.length; if (idr) w.idr++;
+      if (w.lastAt !== null) w.maxGapMs = Math.max(w.maxGapMs, now - w.lastAt);
+      w.lastAt = now;
+      for (const type of types) w.nal.set(type, (w.nal.get(type) ?? 0) + 1);
+    }
+    if (idr) slot.lastIdrAt = now;
     if (slot === this.#active) { this.#write(unit); return; }
-    const idr = annexBHasIdr(unit);
     if (slot !== this.#standby) {
       // No role yet (still starting): keep units from the latest IDR so nothing is lost.
       if (idr) slot.pending = [unit];
@@ -219,7 +391,9 @@ export class E10RollingSession {
     slot.pending = [];
     const old = this.#active;
     this.#standby = null;
-    this.#activate(slot);
+    if (old && (this.options.diagnosticsMilliseconds ?? 60_000) > 0) this.#log("e10_call_window", this.#windowLine(old, "before_splice"));
+    if (old) this.#stopSlotTimers(old);
+    this.#activate(slot, old ? "splice" : "reconnect");
     for (const unit of units) this.#write(unit);
     if (old) {
       this.rollover.e10Rollovers++;
@@ -289,6 +463,7 @@ export class E10RollingSession {
   async #closeSlot(slot: Slot): Promise<void> {
     if (slot.closing) return;
     slot.closing = true;
+    this.#stopSlotTimers(slot);
     // A deliberate close of an old call is not an outage.
     if (!slot.call.output.listenerCount("error")) slot.call.output.on("error", () => {});
     try { await slot.call.close(); } catch { /* retired either way */ }
