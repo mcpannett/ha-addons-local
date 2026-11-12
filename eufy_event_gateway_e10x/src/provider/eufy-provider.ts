@@ -109,6 +109,10 @@ const E10_ROLLOVER_MODE = ((value): "overlap" | "sequential" => value === "overl
   process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_ROLLOVER_MODE);
 /** LOCAL EXPERIMENT 0004: replace a degraded post-rollover call (default on; "false" disables). */
 const E10_HEALTH_GUARD = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_HEALTH_GUARD !== "false";
+/** LOCAL EXPERIMENT 0005: rebuild the provider session after a refused E10 call (default on). */
+const E10_RECONNECT_ON_REFUSAL = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_RECONNECT_ON_REFUSAL !== "false";
+/** 0005: wait before each successive reconnect; the last repeats. Reset after a call starts. */
+const E10_RECONNECT_DELAYS_MS: readonly number[] = [5_000, 15_000, 30_000, 60_000, 120_000];
 const knownPushModels = new Set(GENERATED_CATALOGUE_DEVICES.flatMap(device => device.models));
 const DSK_REFRESH_SKEW_MILLISECONDS = 60_000;
 
@@ -825,6 +829,9 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
   #push: MegaPushReceiver | null = null;
   #startupGeneration = 0;
   #events: ProviderEvents | null = null;
+  /** LOCAL EXPERIMENT 0005: reconnect-on-refusal state; survives the rebuilt sources. */
+  #e10Recovery: { attempt: number; timer: NodeJS.Timeout | null; inFlight: boolean; firstRefusalAt: number | null; refusals: number; reconnects: number } =
+    { attempt: 0, timer: null, inFlight: false, firstRefusalAt: null, refusals: 0, reconnects: 0 };
   #captchaChallenge: CaptchaChallenge | null = null;
   #verificationRequired = false;
   #stationRefreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -2211,6 +2218,8 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
           mode: E10_ROLLOVER_MODE, ...(E10_HEALTH_GUARD ? {} : { healthWatchMilliseconds: 0 }),
           signal: entry.controller.signal, ready: (output, codec) => binding.ready(output, codec),
           log: (event, message) => logger.warn(event, message),
+          onRefused: detail => this.#e10Refused(detail),
+          onCallStarted: index => this.#e10CallStarted(index),
           create: async index => {
             if (index === 0) return make(context);
             if (!binding.current()) throw new NvrTrialError("cancelled");
@@ -4550,7 +4559,60 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
   }
 
   /** Retire startup and push synchronously before cancelling shared cloud work. */
+  /** LOCAL EXPERIMENT 0005: an E10 call was refused; schedule one session rebuild with backoff. */
+  #e10Refused(detail: string): void {
+    const r = this.#e10Recovery;
+    r.refusals++;
+    if (r.firstRefusalAt === null) r.firstRefusalAt = Date.now();
+    logger.warn("e10_recovery_refusal", `${detail} refusals=${r.refusals} attempt=${r.attempt}`);
+    if (!E10_RECONNECT_ON_REFUSAL || r.timer || r.inFlight || !this.#events || this.#recordingClosing) return;
+    const delay = E10_RECONNECT_DELAYS_MS[Math.min(r.attempt, E10_RECONNECT_DELAYS_MS.length - 1)]!;
+    r.attempt++;
+    const attempt = r.attempt;
+    logger.warn("e10_recovery_reconnect_scheduled", `delay_ms=${delay} attempt=${attempt}`);
+    r.timer = setTimeout(() => { r.timer = null; void this.#e10Reconnect(attempt); }, delay);
+    r.timer.unref?.();
+  }
+
+  /**
+   * 0005: drop and rebuild the provider's Eufy session exactly as a fresh start
+   * does (stop provider resources, then start(): stored session restore, inventory,
+   * push). No forced login and no account, binding, region or camera change.
+   * The viewer's next request then places the retry call.
+   */
+  async #e10Reconnect(attempt: number): Promise<void> {
+    const r = this.#e10Recovery;
+    const events = this.#events;
+    if (r.inFlight || !events || this.#recordingClosing) return;
+    r.inFlight = true;
+    const started = Date.now();
+    logger.warn("e10_recovery_reconnect", `stage=begin attempt=${attempt}`);
+    try {
+      this.#assertRtcPreparationIdle();
+      ++this.#startupGeneration;
+      await this.#stopProviderResources();
+      await this.start(events);
+      r.reconnects++;
+      logger.warn("e10_recovery_reconnect", `stage=done attempt=${attempt} took_ms=${Date.now() - started} reconnects=${r.reconnects}`);
+      logger.warn("e10_recovery_retry", `attempt=${attempt} waiting_for=viewer_call`);
+    } catch (error) {
+      logger.warn("e10_recovery_reconnect", `stage=failed attempt=${attempt} took_ms=${Date.now() - started} error=${safeError(error)}`);
+    } finally { r.inFlight = false; }
+  }
+
+  /** 0005: a call started; reset the backoff and report the recovery time. */
+  #e10CallStarted(index: number): void {
+    const r = this.#e10Recovery;
+    if (r.attempt === 0 && r.firstRefusalAt === null) return;
+    const recover = r.firstRefusalAt === null ? 0 : Date.now() - r.firstRefusalAt;
+    logger.warn("e10_recovery_success", `call=${index} recover_ms=${recover} attempts=${r.attempt} reconnects=${r.reconnects}`);
+    r.attempt = 0; r.firstRefusalAt = null;
+    if (r.timer) { clearTimeout(r.timer); r.timer = null; }
+  }
+
   async close(): Promise<void> {
+    const recovery = this.#e10Recovery;
+    if (recovery.timer) { clearTimeout(recovery.timer); recovery.timer = null; }
     this.#rtcPreparation.retire();
     this.#rtcPreparationOwner = null;
     this.#recordingClosing = true;

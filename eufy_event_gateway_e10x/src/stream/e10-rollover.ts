@@ -78,6 +78,10 @@ export interface E10RolloverOptions {
   /** 0004 diagnostics: log value-free per-call windows for this long after activation. Default 60 000 (0 = off). */
   readonly diagnosticsMilliseconds?: number;
   readonly diagnosticsWindowMilliseconds?: number;
+  /** 0005: a call was refused (failed at stage=call, or failed without any media/offer). Value-free detail. */
+  readonly onRefused?: (detail: string) => void;
+  /** 0005: a call started and delivered its first unit (used to reset the refusal backoff). */
+  readonly onCallStarted?: (index: number) => void;
 }
 
 /** Value-free per-call counters for one diagnostics window. */
@@ -196,12 +200,18 @@ export class E10RollingSession {
       this.#opening = false;
       this.rollover.e10CallFailures++;
       this.#log("e10_rollover_call_failed", `call=${index} stage=start reason=${(error as { reason?: string })?.reason ?? "unknown"} concurrent=${this.#calls.size}`);
+      const failure = error as { stage?: string; reason?: string };
+      const media = this.#stat(slot, "packets") + this.#stat(slot, "video");
+      if (failure?.stage === "call" || failure?.stage !== "cancelled" && media === 0) {
+        try { this.options.onRefused?.(`call=${index} stage=${failure?.stage ?? "unknown"} reason=${failure?.reason ?? "unknown"}`); } catch { /* never affects media */ }
+      }
       this.#ended(slot, "start_failed");
       if (index === 0) throw error;
       return null;
     }
     this.#opening = false;
     if (this.#retired) { void this.#closeSlot(slot); return null; }
+    if (!slot.ended) { try { this.options.onCallStarted?.(index); } catch { /* never affects media */ } }
     slot.ended ? null : this.#log("e10_rollover_call_started", `call=${index} concurrent=${this.#calls.size} since_start_ms=${Math.round(this.#now - slot.startedAt)}`);
     return slot.ended ? null : slot;
   }
