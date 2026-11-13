@@ -62,12 +62,13 @@ export interface E10RolloverOptions {
   /** 0004: in sequential mode, wait at most this long for the old call's hang-up before placing the next. Default 2 000. */
   readonly sequentialCloseWaitMilliseconds?: number;
   /**
-   * 0004 health guard for a call that became active after a splice or reconnect.
-   * During healthWatchMilliseconds after activation, the call is "degraded" if a
+   * 0004/0006 health guard for an active call. The call is "degraded" if a
    * healthWindowMilliseconds window has fewer than healthMinUnits units, or if no
-   * further IDR arrives within healthIdrDeadlineMilliseconds. A degraded call is
-   * hung up and replaced by a fresh call (sequential), and an overlap session
-   * switches to sequential. 0 healthWatchMilliseconds disables the guard.
+   * IDR arrives within healthIdrDeadlineMilliseconds of activation or of the last
+   * IDR. A degraded call is hung up and replaced by a fresh call (sequential),
+   * and an overlap session switches to sequential. 0 healthWatchMilliseconds
+   * disables the guard. A positive finite value still limits the watch to that
+   * long after activation; the default is the whole call.
    */
   readonly healthWatchMilliseconds?: number;
   readonly healthWindowMilliseconds?: number;
@@ -226,7 +227,8 @@ export class E10RollingSession {
       if (this.#mode === "sequential") void this.#sequentialRoll(); else void this.#prepareStandby();
     }, wait);
     this.#timer.unref?.();
-    if (how !== "first") { this.#startDiagnostics(slot, how); this.#startHealth(slot); }
+    this.#startHealth(slot);
+    if (how !== "first") this.#startDiagnostics(slot, how);
   }
 
   /** 0004: hang up the active call first, then place the next (no concurrent calls). */
@@ -290,11 +292,11 @@ export class E10RollingSession {
   }
 
   #startHealth(slot: Slot): void {
-    const watch = this.options.healthWatchMilliseconds ?? 30_000;
+    const watch = this.options.healthWatchMilliseconds ?? Number.POSITIVE_INFINITY;
     if (watch <= 0) return;
-    const windowMs = Math.max(100, this.options.healthWindowMilliseconds ?? 5_000);
+    const windowMs = Math.max(100, this.options.healthWindowMilliseconds ?? 10_000);
     const minUnits = this.options.healthMinUnits ?? 10;
-    const idrDeadline = this.options.healthIdrDeadlineMilliseconds ?? 8_000;
+    const idrDeadline = this.options.healthIdrDeadlineMilliseconds ?? 10_000;
     const activatedAt = slot.activatedAt ?? this.#now;
     slot.health = newWindow();
     let windowStart = activatedAt;
@@ -307,9 +309,10 @@ export class E10RollingSession {
         if (slot.health.units < minUnits) reason = `low_rate units=${slot.health.units} window_ms=${windowMs}`;
         slot.health = newWindow(); windowStart = now;
       }
-      if (!reason && now - activatedAt >= idrDeadline && (slot.lastIdrAt === null || slot.lastIdrAt <= activatedAt)) reason = `no_idr after_ms=${Math.round(now - activatedAt)}`;
+      const sinceIdr = now - (slot.lastIdrAt ?? activatedAt);
+      if (!reason && sinceIdr >= idrDeadline) reason = `no_idr after_ms=${Math.round(sinceIdr)}`;
       if (reason) { void this.#degraded(slot, reason); return; }
-      if (now - activatedAt >= watch) {
+      if (Number.isFinite(watch) && now - activatedAt >= watch) {
         if (slot.healthTimer) clearInterval(slot.healthTimer); slot.healthTimer = null;
         this.#degradedStreak = 0;
       }
