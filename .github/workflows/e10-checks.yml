@@ -22,3 +22,26 @@ jobs:
       - run: npm run test:shell
       - run: npm run test:e10
       - run: npm run build
+
+  ha-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install awesomeversion pyyaml
+      - name: HA must see the add-on version as newer than the last release
+        run: |
+          python - <<'PY'
+          import yaml
+          from awesomeversion import AwesomeVersion
+          new = str(yaml.safe_load(open("eufy_event_gateway_e10x/config.yaml"))["version"])
+          def newer(latest, installed):
+              try: return AwesomeVersion(latest) > installed
+              except Exception as e: return f"compare error: {e}"
+          print("diagnosis e10x7 > e10x6:", newer("0.1.259-e10x7", "0.1.259-e10x6"))
+          result = newer(new, "0.1.259-e10x6")
+          print(f"{new} > 0.1.259-e10x6:", result)
+          assert result is True, "HA would not offer this update"
+          PY

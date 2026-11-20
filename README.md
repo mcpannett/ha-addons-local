@@ -35,4 +35,6 @@ Eufy still has to set up each call over the internet (every ~5 minutes). Video c
 
 Fake-call tests (no camera needed): `npm run test:e10`.
 
-**Rollback:** tag `pre-e10x7` marks the last e10x6 commit. To go back, reset `main` to that tag (or revert the merge), bump `version` in `config.yaml` above the current one, and update the add-on in HA.
+**Rollback:** branch `backup/pre-e10x7` marks the last e10x6 commit. To go back, reset `main` to that branch (or revert the merge), bump `version` in `config.yaml` above the current one, and update the add-on in HA.
+
+**Versions:** from 0.1.259.7 the add-on uses plain numbers (`0.1.259.N`). HA's update button could not tell `-e10x7` was newer than `-e10x6`.
