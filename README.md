@@ -12,6 +12,24 @@ Base version: 0.1.259. Additions, all **off by default**:
 - `experimental_e10_call_limit_s` (default 300): the per-call limit used for the rollover timing.
 - `experimental_e10_signal_tolerance` (`off` | `log` | `tolerate`) and `experimental_e10_signal_grace_ms`: value-free logging of unexpected E10 signalling messages, and optionally ignoring them while video keeps flowing.
 
+Other E10 options added later (rollover mode, health guard, reconnect after refusal, route log, no relay, local stream key, LAN probe) are described below and in [`eufy_event_gateway_e10x/CHANGELOG.md`](eufy_event_gateway_e10x/CHANGELOG.md).
+
+## Status (20 Nov 2026, version 0.1.259.8)
+
+Tested on a real Window Camera E10 (T8404), standalone Wi-Fi, viewed continuously in Frigate:
+
+| | Result |
+|---|---|
+| Stream past Eufy's 5-minute call limit | **Works.** About 1 hour over two tests, 12 sequential rollovers (one every ~4.5 min), one call at a time, no recoveries, no errors |
+| Video route | **LAN.** All 14 logged calls went direct on the home network (`host` → `prflx`, private address). None used Eufy's relay, even with the relay allowed |
+| No relay on | **Works.** Every call `path=lan lan=true`, stream unchanged |
+| Smoothness | ~15 fps. Switch-over gaps hidden (Frigate max gap under 300 ms at handovers); one isolated 964 ms gap mid-call |
+| Fully local (no Eufy servers) | **Not possible on current firmware.** The E10 does not answer the PPCS LAN lookup on UDP 32108 (3/3 rounds), and it has no RTSP |
+
+In short: Eufy's servers still set up each call every ~5 minutes, but the video itself stays on the LAN, and the rollover keeps the stream continuous.
+
+**Recommended E10 settings:** call rollover lead `30`, rollover mode `sequential`, health guard on, route log on, no relay on. LAN probe off (diagnostic only).
+
 Only run one instance of the gateway per Eufy account, and do not run it at the same time as the upstream add-on (both use port 3218).
 
 ### e10x7: keep E10 video on the LAN (all opt-in)
