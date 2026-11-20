@@ -45,6 +45,12 @@ export EUFY_GATEWAY_EXPERIMENTAL_E10_CALL_LIMIT_S="$(jq -r '.experimental_e10_ca
 export EUFY_GATEWAY_EXPERIMENTAL_E10_ROLLOVER_MODE="$(jq -r '.experimental_e10_rollover_mode // "sequential"' "$options")"
 export EUFY_GATEWAY_EXPERIMENTAL_E10_HEALTH_GUARD="$(jq -r 'if .experimental_e10_health_guard == false then "false" else "true" end' "$options")"
 export EUFY_GATEWAY_STREAM_GRACE_SECONDS="$(jq -r '.experimental_stream_grace_s // 10' "$options")"
+# LOCAL EXPERIMENT e10x7: reconnect after a refused E10 call (default true), no TURN relay (default false),
+# value-free route log (default true) and an optional fixed key for E10 stream URLs (default empty = off).
+export EUFY_GATEWAY_EXPERIMENTAL_E10_RECONNECT_ON_REFUSAL="$(jq -r 'if .experimental_e10_reconnect_on_refusal == false then "false" else "true" end' "$options")"
+export EUFY_GATEWAY_EXPERIMENTAL_E10_NO_RELAY="$(jq -r 'if .experimental_e10_no_relay == true then "true" else "false" end' "$options")"
+export EUFY_GATEWAY_EXPERIMENTAL_E10_ROUTE_LOG="$(jq -r 'if .experimental_e10_route_log == false then "false" else "true" end' "$options")"
+export EUFY_GATEWAY_E10_LOCAL_STREAM_KEY="$(jq -r '.experimental_e10_local_stream_key // ""' "$options")"
 if [ ! -s "$token_file" ]; then
   umask 077
   token_tmp="${token_file}.tmp"

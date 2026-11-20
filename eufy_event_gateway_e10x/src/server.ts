@@ -38,6 +38,7 @@ import { BundleCapture, diagnosticTargets, type DiagnosticMedia } from "./diagno
 import { diagnosticsPage } from "./diagnostics/page.js";
 import type { EventImageCapture } from "./diagnostics/event-image-capture.js";
 import { safeCameraModel } from "./domain/safe-camera-model.js";
+import { E10_LOCAL_KEY_QUERY, e10LocalKeyAuthorizes } from "./e10-local-key.js";
 
 import type { GatewayConfig } from "./config.js";
 import { GatewayState } from "./domain/gateway-state.js";
@@ -441,7 +442,11 @@ export class GatewayServer {
             ? url.searchParams.getAll(STREAM_TOKEN_QUERY).length === 1
               && validateNativeStreamToken(segments[2]!, url.searchParams.get(STREAM_TOKEN_QUERY), this.config.apiToken)
             : validateStreamToken(segments[2]!, url.searchParams.get(STREAM_TOKEN_QUERY), this.config.apiToken));
-        if (!streamAuthorized && !isBearerAuthorized(request.headers.authorization, this.config.apiToken)) {
+        // LOCAL EXPERIMENT (e10x7): a fixed, user-set key opens E10 stream URLs only (never controls or other APIs).
+        const e10KeyAuthorized = !streamAuthorized && e10LocalKeyAuthorizes({ configured: this.config.e10LocalStreamKey ?? null,
+          method: request.method, segments, supplied: url.searchParams.getAll(E10_LOCAL_KEY_QUERY),
+          isE10: serial => this.state.hasCamera(serial) && this.state.getCamera(serial).model === "T8404" });
+        if (!streamAuthorized && !e10KeyAuthorized && !isBearerAuthorized(request.headers.authorization, this.config.apiToken)) {
           return json(response, 401, generalTrial || generalPreparation ? { stage: "admission" } : { error: "Unauthorized" });
         }
       }

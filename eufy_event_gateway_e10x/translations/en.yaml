@@ -47,6 +47,36 @@ configuration:
   capture_failed_event_images:
     name: Capture failed event images
     description: Private diagnostic capture for 30 minutes after startup. Export within 60 minutes. May contain household images and identifiers. Disable after collecting evidence.
+  experimental_e10_signal_tolerance:
+    name: E10 signal tolerance
+    description: off, log or tolerate. Logs (value-free) or ignores unexpected E10 signalling while video keeps flowing. Default off.
+  experimental_e10_signal_grace_ms:
+    name: E10 signal grace (ms)
+    description: With tolerate, how long video may pause after an ignored message before the call fails. Default 3000.
+  experimental_e10_call_rollover_lead_s:
+    name: E10 call rollover lead (s)
+    description: 0 = off. Otherwise start the next E10 call this many seconds before the per-call limit so live view stays continuous. 5 to 120.
+  experimental_e10_call_limit_s:
+    name: E10 per-call limit (s)
+    description: The service's E10 call limit used for rollover timing. Default 300.
+  experimental_e10_rollover_mode:
+    name: E10 rollover mode
+    description: sequential (default) hangs up the old call before placing the next. overlap runs two calls briefly for a seamless switch.
+  experimental_e10_health_guard:
+    name: E10 health guard
+    description: Replace an E10 call whose video thins out or stops sending keyframes. Default on.
+  experimental_e10_reconnect_on_refusal:
+    name: E10 reconnect after refusal
+    description: Rebuild the session with backoff when the service refuses an E10 call. Default on.
+  experimental_e10_no_relay:
+    name: E10 no relay (LAN only)
+    description: Do not use the service's video relay for E10 calls, so video can only flow directly on your network. If the camera cannot be reached directly, live view fails. Default off.
+  experimental_e10_route_log:
+    name: E10 route log
+    description: Log whether each E10 call's video took the LAN, a NAT route or the relay. No addresses are logged. Default on.
+  experimental_e10_local_stream_key:
+    name: E10 local stream key
+    description: Optional. At least 24 characters. When set, /api/cameras/<serial>/live.ts?key=<key> serves E10 live video for go2rtc or Frigate. Only E10 stream URLs accept it. Leave empty to turn off.
   username:
     name: Eufy username
     description: Dedicated guest Eufy account shared with the required cameras.
@@ -55,7 +85,7 @@ configuration:
     description: Password for the dedicated guest Eufy account.
   country:
     name: Country
-    description: Two-letter country code for the Eufy account, such as AU.
+    description: Two-letter country code for the Eufy account, such as GB.
   verification_code:
     name: Verification code
     description: Temporary email code requested by Eufy during first sign-in. Remove it after the app connects.

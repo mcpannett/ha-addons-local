@@ -9,6 +9,7 @@
  * prevents the HTTP and Eufy layers from drifting apart.
  */
 import { resolve } from "node:path";
+import { e10LocalKeyConfig } from "./e10-local-key.js";
 
 /** Fully validated settings used by the running gateway process. */
 export interface GatewayConfig {
@@ -67,6 +68,9 @@ export interface GatewayConfig {
 
   /** Default-off six-second live-view jitter buffer for the qualified S340/HomeBase 3 route. */
   readonly experimentalS340SmoothLive: boolean;
+
+  /** LOCAL EXPERIMENT (e10x7): fixed key accepted on E10 live.ts/live.h264 URLs only; null (default) = off. */
+  readonly e10LocalStreamKey: string | null;
 
   /** Fixed regional service selection, never an arbitrary credential target. */
   readonly experimentalNvrRegion: "auto" | "us" | "eu" | "ie";
@@ -163,6 +167,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Gatewa
     experimentalFixedH265Resolution,
     experimentalLowCpuH265Conversion,
     experimentalS340SmoothLive,
+    e10LocalStreamKey: e10LocalKeyConfig(environment.EUFY_GATEWAY_E10_LOCAL_STREAM_KEY),
     experimentalNvrRegion: experimentalNvrRegion as "auto" | "us" | "eu" | "ie",
     eufy: {
       username: nonEmpty(environment.EUFY_USERNAME),

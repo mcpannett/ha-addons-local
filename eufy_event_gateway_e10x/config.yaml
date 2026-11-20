@@ -1,5 +1,5 @@
 name: Eufy Mega Security (experimental build)
-version: "0.1.259-e10x6"
+version: "0.1.259-e10x7"
 slug: eufy_event_gateway_e10x
 description: Experimental build of eufy-mega-security with an optional E10 call-rollover option (off by default)
 url: https://github.com/mcpannett/ha-addons-local
@@ -24,7 +24,7 @@ discovery:
 options:
   username: ""
   password: ""
-  country: AU
+  country: GB
   verification_code: ""
   experimental_event_image_request: false
   experimental_homebase_event_images: false
@@ -51,6 +51,9 @@ options:
   experimental_e10_rollover_mode: sequential
   experimental_e10_health_guard: true
   experimental_stream_grace_s: 10
+  experimental_e10_reconnect_on_refusal: true
+  experimental_e10_no_relay: false
+  experimental_e10_route_log: true
 schema:
   username: str
   password: password
@@ -81,3 +84,7 @@ schema:
   experimental_e10_rollover_mode: list(sequential|overlap)?
   experimental_e10_health_guard: bool?
   experimental_stream_grace_s: int(10,120)?
+  experimental_e10_reconnect_on_refusal: bool?
+  experimental_e10_no_relay: bool?
+  experimental_e10_route_log: bool?
+  experimental_e10_local_stream_key: password?

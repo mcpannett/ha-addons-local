@@ -22,6 +22,7 @@ import { recordRaw } from "../diagnostics/raw-history.js";
 import { DoorbellH264Assembler } from "./doorbell-rtp.js";
 import { doorbellRtcOffer, doorbellRtcAnswer, type DoorbellRtcOffer } from "./doorbell-rtc-offer.js";
 import { refineE10OfferFailure } from "./e10-offer-diagnostic.js";
+import { e10IceServers, e10RouteLine, e10RouteSummary, type E10CandidateLike } from "./e10-route.js";
 import { VideoParameterSetCache } from "./live-stream-manager.js";
 import { markSourceTime } from "./media-source-clock.js";
 import { installNvrIceTiming } from "./nvr-ice-timing.js";
@@ -178,6 +179,10 @@ export interface NvrRtcOptions {
    * Summaries are value-free: allowlisted names, kinds, lengths and counters only.
    */
   readonly onE10Signal?: (summary: string, tolerated: boolean, event?: string) => void;
+  /** LOCAL EXPERIMENT (e10x7): drop the service's TURN relays so E10 media can only use direct (LAN/NAT) routes. */
+  readonly e10NoRelay?: boolean;
+  /** LOCAL EXPERIMENT (e10x7): value-free route line once the E10 peer connects (path, candidate types, lan). */
+  readonly onE10Route?: (line: string) => void;
 
   /**
    * Total owned lifetime, including signalling and media. Omission keeps the
@@ -1199,10 +1204,21 @@ export class NvrRtcSession {
       this.#mid = offer.mid; this.#stage = "negotiation";
       this.#markTiming("offer");
       let peer: RTCPeerConnection;
-      try { peer = this.#peer = this.dependencies.peer(this.#turn, this.#e10Offer ?? undefined);
+      try { peer = this.#peer = this.dependencies.peer(this.#e10Offer ? e10IceServers(this.#turn, this.options.e10NoRelay === true) : this.#turn, this.#e10Offer ?? undefined);
         observeRawPeer(peer, { station: this.options.station, camera: this.options.camera }); }
       catch { throw new NvrTrialError("negotiation", "peer_setup"); }
       peer.connectionStateChange.subscribe(state => { if (state === "failed" || state === "disconnected") this.#fail("negotiation", state === "failed" ? "peer_failed" : "peer_disconnected"); });
+      if (this.#e10Offer && this.options.onE10Route) {
+        let reported = false;
+        peer.connectionStateChange.subscribe(state => {
+          if (state !== "connected" || reported || this.#retired) return;
+          reported = true;
+          try {
+            const pair = (peer.iceTransports[0]?.connection as unknown as { nominated?: { localCandidate?: E10CandidateLike; remoteCandidate?: E10CandidateLike } } | undefined)?.nominated;
+            this.options.onE10Route?.(e10RouteLine(e10RouteSummary(pair?.localCandidate, pair?.remoteCandidate)));
+          } catch { /* diagnostics only */ }
+        });
+      }
       peer.onIceCandidate.subscribe(candidate => {
         if (!candidate?.candidate || this.#retired) return;
         this.#markTiming("firstLocalCandidate");

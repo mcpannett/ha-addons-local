@@ -111,6 +111,10 @@ const E10_ROLLOVER_MODE = ((value): "overlap" | "sequential" => value === "overl
 const E10_HEALTH_GUARD = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_HEALTH_GUARD !== "false";
 /** LOCAL EXPERIMENT 0005: rebuild the provider session after a refused E10 call (default on). */
 const E10_RECONNECT_ON_REFUSAL = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_RECONNECT_ON_REFUSAL !== "false";
+/** LOCAL EXPERIMENT (e10x7): E10 calls offer no TURN relay, so media can only take a direct LAN/NAT route (default off). */
+const E10_NO_RELAY = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_NO_RELAY === "true";
+/** LOCAL EXPERIMENT (e10x7): log the media route of each E10 call (default on; value-free). */
+const E10_ROUTE_LOG = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_ROUTE_LOG !== "false";
 /** 0005: wait before each successive reconnect; the last repeats. Reset after a call starts. */
 const E10_RECONNECT_DELAYS_MS: readonly number[] = [5_000, 15_000, 30_000, 60_000, 120_000];
 const knownPushModels = new Set(GENERATED_CATALOGUE_DEVICES.flatMap(device => device.models));
@@ -2202,6 +2206,9 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
         // LOCAL EXPERIMENT (call rollover): inner calls report to the rolling source, not the manager.
         ...(rolling ? { ready: (): void => {}, e10HangupEndsCall: true } : {}),
         e10RtpTrial: e10,
+        // LOCAL EXPERIMENT (e10x7): see e10-route.ts. Both default to the previous behaviour except the value-free route log.
+        ...(e10 && E10_NO_RELAY ? { e10NoRelay: true } : {}),
+        ...(e10 && E10_ROUTE_LOG ? { onE10Route: (line: string) => logger.info("e10_route", line) } : {}),
         // LOCAL EXPERIMENT: default off, see nvr-rtc-session.ts.
         e10SignalTolerance: E10_SIGNAL_TOLERANCE, e10SignalVideoGraceMilliseconds: E10_SIGNAL_GRACE_MS,
         onE10Signal: (summary: string, tolerated: boolean, event?: string) => {
@@ -2225,7 +2232,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
             if (!binding.current()) throw new NvrTrialError("cancelled");
             return make(await this.#client.nvrSignallingContext(entry.station.serial, region, entry.controller.signal));
           } });
-        logger.info("e10_rollover_enabled", `lead_ms=${E10_ROLLOVER_LEAD_MS} call_limit_ms=${E10_CALL_LIMIT_MS} mode=${E10_ROLLOVER_MODE} health_guard=${E10_HEALTH_GUARD}`);
+        logger.info("e10_rollover_enabled", `lead_ms=${E10_ROLLOVER_LEAD_MS} call_limit_ms=${E10_CALL_LIMIT_MS} mode=${E10_ROLLOVER_MODE} health_guard=${E10_HEALTH_GUARD} no_relay=${E10_NO_RELAY}`);
         entry.session = source as unknown as NvrRtcSession;
         return entry.session;
       }
