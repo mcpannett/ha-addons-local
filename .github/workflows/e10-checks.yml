@@ -41,7 +41,8 @@ jobs:
               try: return AwesomeVersion(latest) > installed
               except Exception as e: return f"compare error: {e}"
           print("diagnosis e10x7 > e10x6:", newer("0.1.259-e10x7", "0.1.259-e10x6"))
-          result = newer(new, "0.1.259-e10x6")
-          print(f"{new} > 0.1.259-e10x6:", result)
-          assert result is True, "HA would not offer this update"
+          for installed in ["0.1.259-e10x6", "0.1.259.7"]:
+              result = newer(new, installed)
+              print(f"{new} > {installed}:", result)
+              assert result is True or new == installed, "HA would not offer this update"
           PY

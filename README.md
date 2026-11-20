@@ -16,7 +16,7 @@ Only run one instance of the gateway per Eufy account, and do not run it at the 
 
 ### e10x7: keep E10 video on the LAN (all opt-in)
 
-- `experimental_e10_route_log` (default on): each E10 call logs `e10_route path=lan|nat|relay`. No addresses are logged. `lan` means video went straight from the camera over your network.
+- `experimental_e10_route_log` (default on): each E10 call logs `e10_route path=lan|nat|relay`. No addresses are logged. `lan` means the camera's address is on your home network and no relay is used (e10x8: also when the camera candidate is `prflx`).
 - `experimental_e10_no_relay` (default off): never use Eufy's video relay for E10 calls. If the camera can't be reached directly, live view fails, so check the route log first.
 - `experimental_e10_reconnect_on_refusal` (default on): now switchable in the UI.
 - `experimental_e10_local_stream_key` (default empty = off): a key of 24+ characters you choose. It lets go2rtc/Frigate use one stable URL that never expires:

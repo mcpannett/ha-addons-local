@@ -10,7 +10,7 @@ export type E10CandidateType = "host" | "srflx" | "prflx" | "relay" | "unknown";
 export interface E10RouteSummary {
   readonly local: E10CandidateType;
   readonly remote: E10CandidateType;
-  /** True only when both ends are host candidates and the camera's address is private. */
+  /** True when no relay is involved and the camera's address is private (host, prflx or srflx). */
   readonly lan: boolean;
   /** "lan" (direct on the home network), "nat" (direct, via router mapping) or "relay" (through the service's TURN relay). */
   readonly path: "lan" | "nat" | "relay" | "unknown";
@@ -41,7 +41,8 @@ export function e10PrivateAddress(host: unknown): boolean {
 
 export function e10RouteSummary(local: E10CandidateLike | null | undefined, remote: E10CandidateLike | null | undefined): E10RouteSummary {
   const l = e10CandidateType(local), r = e10CandidateType(remote);
-  const lan = l === "host" && r === "host" && e10PrivateAddress(remote?.host);
+  // e10x8: a peer-reflexive (prflx) camera candidate with a private address is still the home LAN.
+  const lan = l !== "relay" && r !== "relay" && l !== "unknown" && r !== "unknown" && e10PrivateAddress(remote?.host);
   const path = l === "unknown" || r === "unknown" ? "unknown"
     : l === "relay" || r === "relay" ? "relay"
       : lan ? "lan" : "nat";

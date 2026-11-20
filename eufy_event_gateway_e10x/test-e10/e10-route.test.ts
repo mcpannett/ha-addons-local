@@ -13,6 +13,15 @@ test("relay on either end is a relay route", () => {
   assert.equal(e10RouteSummary({ type: "host", host: "192.168.1.2" }, { type: "relay", host: "5.6.7.8" }).path, "relay");
 });
 
+test("prflx camera with a private address is LAN (seen on real E10)", () => {
+  const s = e10RouteSummary({ type: "host", host: "192.168.1.20" }, { type: "prflx", host: "192.168.1.55" });
+  assert.deepEqual(s, { local: "host", remote: "prflx", lan: true, path: "lan" });
+});
+
+test("prflx camera with a public address stays NAT", () => {
+  assert.equal(e10RouteSummary({ type: "host", host: "192.168.1.20" }, { type: "prflx", host: "81.2.3.4" }).path, "nat");
+});
+
 test("direct but not private is NAT", () => {
   assert.equal(e10RouteSummary({ type: "srflx" }, { type: "srflx", host: "81.2.3.4" }).path, "nat");
   assert.equal(e10RouteSummary({ type: "host" }, { type: "host", host: "81.2.3.4" }).path, "nat");

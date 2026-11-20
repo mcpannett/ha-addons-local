@@ -1,5 +1,5 @@
 name: Eufy Mega Security (experimental build)
-version: "0.1.259.7"
+version: "0.1.259.8"
 slug: eufy_event_gateway_e10x
 description: Experimental build of eufy-mega-security with an optional E10 call-rollover option (off by default)
 url: https://github.com/mcpannett/ha-addons-local
