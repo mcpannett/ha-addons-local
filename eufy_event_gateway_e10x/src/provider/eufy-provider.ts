@@ -38,6 +38,7 @@ import { careMonitorPushKind, careMonitorSensorState } from "./care-monitor.js";
 import { E21ControlError, e21Readings, e21PreferenceContracts, e21PreferenceNames, isE21, validateE21Preference, type E21Readings } from "./e21-profile.js";
 import { NvrRtcSession, type NvrSwitchTarget } from "../stream/nvr-rtc-session.js";
 import { E10RollingSession } from "../stream/e10-rollover.js";
+import { e10LanProbe, e10LanProbeLine } from "../stream/e10-lan-probe.js";
 import { NvrTrialError, nvrTrialSensor, type NvrSource, type NvrStateSummary } from "../stream/nvr-protocol.js";
 import { modelControlTrialActions, parseModelControlTrial, runModelControlTrial, type ModelControlRoute, type ModelControlTrial, type ModelControlTrialAdmission, type ModelControlTrialFailureStage, type ModelControlTrialResult, type AlarmStateTrialResult } from "./model-control-trials.js";
 import { join } from "node:path";
@@ -115,6 +116,10 @@ const E10_RECONNECT_ON_REFUSAL = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_RECON
 const E10_NO_RELAY = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_NO_RELAY === "true";
 /** LOCAL EXPERIMENT (e10x7): log the media route of each E10 call (default on; value-free). */
 const E10_ROUTE_LOG = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_ROUTE_LOG !== "false";
+/** LOCAL EXPERIMENT (e10x7): read-only PPCS LAN lookup probe of the E10 after inventory loads (default off). */
+const E10_LAN_PROBE = process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_LAN_PROBE === "true";
+/** Optional E10 LAN address for the probe when inventory has none. Only private IPv4 is used. */
+const E10_LAN_IP = (process.env.EUFY_GATEWAY_EXPERIMENTAL_E10_LAN_IP ?? "").trim() || null;
 /** 0005: wait before each successive reconnect; the last repeats. Reset after a call starts. */
 const E10_RECONNECT_DELAYS_MS: readonly number[] = [5_000, 15_000, 30_000, 60_000, 120_000];
 const knownPushModels = new Set(GENERATED_CATALOGUE_DEVICES.flatMap(device => device.models));
@@ -4566,6 +4571,25 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
   }
 
   /** Retire startup and push synchronously before cancelling shared cloud work. */
+  /** LOCAL EXPERIMENT (e10x7): read-only LAN lookup probe for each E10, three rounds a minute apart. Never blocks startup. */
+  #e10LanProbes(devices: readonly MegaInventoryDevice[]): void {
+    const cameras = devices.filter(device => device.model === "T8404" && device.deviceType === 314);
+    if (!cameras.length) { logger.info("e10_lan_probe", "skipped=no_e10"); return; }
+    for (const device of cameras) {
+      const inventory = device.localAddress;
+      const address = inventory ?? E10_LAN_IP;
+      const facts = `has_p2p_did=${!!device.p2pDid} has_p2p_connection=${!!device.p2pConnection} has_local_address=${!!inventory}`;
+      for (let round = 0; round < 3; round++) {
+        const timer = setTimeout(() => {
+          void e10LanProbe({ address, target: inventory ? "inventory" : "configured" })
+            .then(result => logger.info("e10_lan_probe", `round=${round + 1} ${e10LanProbeLine(result)} ${facts}`))
+            .catch(error => logger.warn("e10_lan_probe", `round=${round + 1} failed=${(error as { code?: string })?.code ?? "error"} ${facts}`));
+        }, 5_000 + round * 60_000);
+        timer.unref?.();
+      }
+    }
+  }
+
   /** LOCAL EXPERIMENT 0005: an E10 call was refused; schedule one session rebuild with backoff. */
   #e10Refused(detail: string): void {
     const r = this.#e10Recovery;
@@ -4956,6 +4980,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
       "inventory_loaded",
       `Mega inventory loaded: devices=${devices.length} accepted=${diagnostics.filter(({ acceptedAsCamera }) => acceptedAsCamera).length} groups=${summaries.length}`,
     );
+    if (E10_LAN_PROBE) this.#e10LanProbes(devices);
     for (const summary of summaries) {
       logger.info(
         "inventory_group",

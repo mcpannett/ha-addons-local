@@ -31,6 +31,8 @@ Only run one instance of the gateway per Eufy account, and do not run it at the 
 
 Eufy still has to set up each call over the internet (every ~5 minutes). Video can stay local; call setup cannot.
 
+- `experimental_e10_lan_probe` (default off, read-only): after sign-in, asks the E10 three times (a minute apart) on UDP 32108 whether it answers the local lookup other Eufy cameras answer. It sends only the 4-byte LAN search and logs `e10_lan_probe answered=true|false` with no addresses. If the inventory has no LAN address for the E10, set `experimental_e10_lan_ip` to its IP from your router. `answered=true` means a fully local stream might be possible. `answered=false` on all three rounds means it isn't, with current firmware.
+
 Fake-call tests (no camera needed): `npm run test:e10`.
 
 **Rollback:** tag `pre-e10x7` marks the last e10x6 commit. To go back, reset `main` to that tag (or revert the merge), bump `version` in `config.yaml` above the current one, and update the add-on in HA.

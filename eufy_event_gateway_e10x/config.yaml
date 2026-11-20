@@ -54,6 +54,7 @@ options:
   experimental_e10_reconnect_on_refusal: true
   experimental_e10_no_relay: false
   experimental_e10_route_log: true
+  experimental_e10_lan_probe: false
 schema:
   username: str
   password: password
@@ -88,3 +89,5 @@ schema:
   experimental_e10_no_relay: bool?
   experimental_e10_route_log: bool?
   experimental_e10_local_stream_key: password?
+  experimental_e10_lan_probe: bool?
+  experimental_e10_lan_ip: str?

@@ -77,6 +77,12 @@ configuration:
   experimental_e10_local_stream_key:
     name: E10 local stream key
     description: Optional. At least 24 characters. When set, /api/cameras/<serial>/live.ts?key=<key> serves E10 live video for go2rtc or Frigate. Only E10 stream URLs accept it. Leave empty to turn off.
+  experimental_e10_lan_probe:
+    name: E10 LAN probe (read-only)
+    description: After sign-in, ask the E10 three times on UDP 32108 whether it answers a local connection lookup like other Eufy cameras. Sends no commands or keys and logs no addresses. Look for e10_lan_probe in the log. Default off.
+  experimental_e10_lan_ip:
+    name: E10 LAN IP for the probe
+    description: Optional. The E10's private IPv4 address (from your router), used only if Eufy's inventory gives none.
   username:
     name: Eufy username
     description: Dedicated guest Eufy account shared with the required cameras.

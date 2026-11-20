@@ -51,6 +51,9 @@ export EUFY_GATEWAY_EXPERIMENTAL_E10_RECONNECT_ON_REFUSAL="$(jq -r 'if .experime
 export EUFY_GATEWAY_EXPERIMENTAL_E10_NO_RELAY="$(jq -r 'if .experimental_e10_no_relay == true then "true" else "false" end' "$options")"
 export EUFY_GATEWAY_EXPERIMENTAL_E10_ROUTE_LOG="$(jq -r 'if .experimental_e10_route_log == false then "false" else "true" end' "$options")"
 export EUFY_GATEWAY_E10_LOCAL_STREAM_KEY="$(jq -r '.experimental_e10_local_stream_key // ""' "$options")"
+# LOCAL EXPERIMENT e10x7: read-only LAN lookup probe (default false) and optional E10 LAN IP for it.
+export EUFY_GATEWAY_EXPERIMENTAL_E10_LAN_PROBE="$(jq -r 'if .experimental_e10_lan_probe == true then "true" else "false" end' "$options")"
+export EUFY_GATEWAY_EXPERIMENTAL_E10_LAN_IP="$(jq -r '.experimental_e10_lan_ip // ""' "$options")"
 if [ ! -s "$token_file" ]; then
   umask 077
   token_tmp="${token_file}.tmp"
