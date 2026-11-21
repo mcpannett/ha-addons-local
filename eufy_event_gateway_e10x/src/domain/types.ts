@@ -141,6 +141,9 @@ export interface CameraReportedSettings {
 /** Complete state returned for one camera by the HTTP API. */
 export interface CameraState {
 
+  /** Reported numeric camera identity, absent on older or simulated providers. */
+  readonly deviceType?: number | null;
+
   /** Optional device-owned secondary firmware and explicit update flag. */
   readonly firmwareSubVersion?: string | null;
   readonly firmwareUpdateAvailable?: boolean | null;
@@ -159,6 +162,14 @@ export interface CameraState {
 
   /** Whether the owned route and known recording baseline admit the verified audio write. */
   readonly audioRecordingControlSupported?: boolean;
+
+  /** Fixed admission result for exact quality trials, containing no account or parameter values. */
+  readonly streamingQualityControlReason?: "trial_disabled" | "owner_account_required" | "api_authentication_required"
+    | "account_binding_unavailable" | "route_unavailable" | "parent_owner_mismatch" | "live_mode_unconfirmed"
+    | "route_unsupported" | "quality_unconfirmed" | "account_membership_unconfirmed" | "live_view_required" | "ready";
+
+  /** Session-scoped values expire with live view and are not saved camera settings. */
+  readonly streamingQualityControlScope?: "active_stream";
 
   /** Whether the owned ready route and known baseline admit native streaming-quality writes. */
   readonly streamingQualityControlSupported?: boolean;
@@ -181,13 +192,19 @@ export interface CameraState {
   /** Exact-route admission for fresh-state-confirmed sensitivity and HomeBase chime writes. */
   readonly motionSensitivityControlSupported?: boolean;
   readonly motionSensitivitySteps?: number | null;
+
+  /** Mark an opt-in sensitivity transport whose physical behaviour is unconfirmed. */
+  readonly motionSensitivityExperimental?: boolean;
   readonly homebaseChimeControlSupported?: boolean;
 
   /** Opt-in exact T8425/T8426 brightness with a readable baseline; physical behaviour is unconfirmed. */
   readonly lightBrightnessControlSupported?: boolean;
 
-  /** Opt-in exact T8426 manual override with independent setting readback. */
+  /** Opt-in model-qualified manual override with independent setting readback. */
   readonly manualFloodlightControlSupported?: boolean;
+
+  /** Admission category only, never account, route or device identifiers. */
+  readonly manualFloodlightControlReason?: ManualLightControlReason;
 
   /** Model-specific streaming choices, used only when control admission is true. */
   readonly streamingQualityModes?: readonly CameraStreamingQualityMode[];
@@ -207,6 +224,9 @@ export interface CameraState {
   /** An admitted one-call NVR route may close an unused HA HLS worker before handoff. */
   readonly hlsIdleHandoverSupported?: boolean;
 
+  /** Exact E340/HB3 route can offer a disabled-by-default, geometry-checked main lens. */
+  readonly mainLensViewSupported?: boolean;
+
 
   /** Strictly validated camera-owned settings, with unknown values left absent. */
   readonly reportedSettings: CameraReportedSettings | null;
@@ -220,8 +240,17 @@ export interface CameraState {
   /** Whether the ready camera route supplies validated AAC for live MPEG-TS delivery. */
   readonly liveAudioSupported?: boolean;
 
+  /** Unconfirmed live audio is offered as a disabled experimental HA entity. */
+  readonly liveAudioExperimental?: boolean;
+
   /** Exact route support for bounded speaker audio, independent of microphone streaming. */
   readonly talkbackSupported?: boolean;
+
+  /** Opt-in live microphone input, separate from prepared speaker uploads. */
+  readonly liveTalkbackSupported?: boolean;
+
+  /** Stable opted-in delivery mode, independent of temporary speaker readiness. */
+  readonly liveTalkbackEnabled?: boolean;
 
   /** The direct route supports verified SD event retrieval; card presence is checked on access. */
   readonly storedRecordingsSupported?: boolean;
@@ -241,6 +270,9 @@ export interface CameraState {
   readonly cameraLightControlSupported: boolean;
 
   /** Offer disabled-by-default light trial buttons without claiming readable lamp state. */
+  /** Advertise disabled-by-default saved-reply controls on the reviewed opt-in route. */
+  readonly experimentalQuickResponseSupported?: boolean;
+
   readonly experimentalLightControlSupported: boolean;
   readonly timedLightControlSupported: boolean;
   readonly cameraSirenControlSupported: boolean;
@@ -283,7 +315,7 @@ export interface NightVisionMode {
 /** One exact model's app-confirmed streaming quality, independent of recorded-video quality. */
 export interface CameraStreamingQualityMode {
   readonly value: number;
-  readonly name: "Auto" | "HD (720P)" | "Full HD (1080P)" | "2K" | "4K" | "Ultra 4K" | "Medium" | "High" | "Low" | "Highest";
+  readonly name: "Auto" | "HD (720P)" | "Full HD (1080P)" | "2K" | "3K" | "4K" | "Ultra 4K" | "Medium" | "High" | "Low" | "Highest";
 }
 
 /** Normalized battery reads exposed only when a device reports each field. */
@@ -302,11 +334,22 @@ export interface BatteryState {
 /** Complete normalized state for one supported standalone security sensor. */
 export interface SecuritySensorState {
   readonly serial: string;
+
+  /** Reported inventory parent, including self for an explicitly direct device. Absent means unknown. */
+  readonly stationSerial?: string;
+
   readonly name: string;
   readonly model: string;
   readonly deviceType: number;
   readonly available: boolean;
-  readonly capabilities: readonly ("battery" | "contact" | "crying" | "lastSeen" | "motion" | "rssi" | "sound" | "pet" | "babyLeft" | "babyEntered" | "temperatureHigh" | "temperatureLow" | "careAreaLeft" | "careAreaEntered" | "babyActivity" | "roomTemperature" | "careDiagnostics")[];
+
+  /** Firmware reported for this accessory, never inherited from its HomeBase. */
+  readonly firmware?: string | null;
+
+  /** Reported entry-sensor health. Absence and invalid values remain unknown. */
+  readonly connected?: boolean | null;
+  readonly batteryLow?: boolean | null;
+  readonly capabilities: readonly ("battery" | "batteryLow" | "connected" | "contact" | "crying" | "lastSeen" | "motion" | "rssi" | "sound" | "pet" | "babyLeft" | "babyEntered" | "temperatureHigh" | "temperatureLow" | "careAreaLeft" | "careAreaEntered" | "babyActivity" | "roomTemperature" | "careDiagnostics")[];
   readonly batteryLevel: number | null;
   readonly contactOpen: boolean | null;
   readonly lastSeen: string | null;
@@ -354,6 +397,15 @@ export interface HomeBaseState {
   /** Whether the model may receive the managed station control set. */
   readonly controlsSupported: boolean;
 
+  /** Exact-model opt-in volume admission, independent of the managed station command set. */
+  readonly alarmVolumeControlSupported?: boolean;
+
+  /** Requires its own reported prompt-volume baseline and authenticated account. */
+  readonly promptVolumeControlSupported?: boolean;
+
+  /** Mark these separate volume controls as an unconfirmed HomeBase 2 trial. */
+  readonly volumeControlsExperimental?: boolean;
+
   /** Whether the station may receive confirmed guard-mode writes. */
   readonly guardModeControlSupported: boolean;
 
@@ -374,6 +426,9 @@ export interface HomeBaseState {
   readonly effectiveModeSource?: "eufy_push" | "nvr_rtc" | null;
   readonly alarmActive: boolean | null;
   readonly alarmVolume: number | null;
+
+  /** Origin of the last volume reading. Inventory is cached and cannot confirm a write. */
+  readonly alarmVolumeSource?: "inventory" | "local";
   readonly promptVolume: number | null;
   readonly alarmTone: number | null;
 
@@ -429,7 +484,21 @@ export function maskSmartLockState(state: SmartLockState, now = Date.now()): Sma
     ...(!fresh(state.settings.observedAt) ? { volume: null, autoLock: null, autoLockDelaySeconds: null, observedAt: null } : {}),
     ...(!fresh(state.settings.notificationsObservedAt) ? { notifications: null, lockedNotifications: null, unlockedNotifications: null, notificationsObservedAt: null } : {}) } : undefined;
   return { ...state, ...(settings ? { settings } : {}),
+    ...(state.lastEvent ? { lastEvent: { ...state.lastEvent } } : {}),
     ...(!fresh(state.stateObservedAt) ? { state: "unknown" as const, available: false, batteryPercent: null } : {}) };
+}
+
+/**
+ * Last accepted Eufy change notification, owned by the current lock binding.
+ * Receipt time and the reported user describe the message, not independently
+ * verified identity or physical state. Manual, automatic and keypad-lock events
+ * have no identified user.
+ */
+export interface SmartLockEvent {
+  readonly action: "locked" | "unlocked";
+  readonly method: "manual" | "automatic" | "keypad" | "passcode" | "fingerprint" | "app" | "temporary_passcode" | "nfc";
+  readonly userName: string | null;
+  readonly receivedAt: string;
 }
 
 /**
@@ -439,8 +508,15 @@ export function maskSmartLockState(state: SmartLockState, now = Date.now()): Sma
  */
 export interface SmartLockState {
   readonly serial: string;
+
+  /** Reported inventory parent, including self for an explicitly direct device. Absent means unknown. */
+  readonly stationSerial?: string;
+
   readonly name: string;
   readonly model: "T85F1" | "T8520" | "T8520J11" | "T8520S";
+
+  /** Lock-owned inventory metadata; it does not refresh the physical state observation. */
+  readonly firmware?: string | null;
 
   /** A cloud inventory profile has no lock, unlock, settings or query authority. */
   readonly readOnly?: true;
@@ -452,6 +528,9 @@ export interface SmartLockState {
   readonly batteryPercent: number | null;
   readonly stateObservedAt: string | null;
   readonly settings?: SmartLockSettings;
+
+  /** Optional notification context, cleared on binding retirement and independent of query freshness. */
+  readonly lastEvent?: SmartLockEvent;
 }
 
 /** Normalized state notifications consumed by the authenticated SSE connection. */
@@ -468,8 +547,15 @@ export type GatewayEvent =
   | { readonly type: "event-image-updated"; readonly cameraSerial: string; readonly eventImage: SnapshotInfo }
   | { readonly type: "connection-updated"; readonly state: ConnectionState; readonly detail: string | null };
 
+/** Content-free reason why a reviewed manual light is unavailable to HA. */
+export type ManualLightControlReason = "ready" | "route_unsupported" | "trial_disabled" | "route_not_ready"
+  | "owner_account_required" | "api_authentication_required" | "account_binding_unavailable" | "parent_owner_mismatch" | "state_unavailable";
+
 /** Stable camera metadata discovered from Mega inventory. */
 export interface CameraIdentity {
+
+  /** Reported numeric camera identity, absent on older or simulated providers. */
+  readonly deviceType?: number | null;
 
   /** Camera-owned firmware metadata. Unknown update status never becomes false. */
   readonly firmwareSubVersion?: string | null;
@@ -489,6 +575,12 @@ export interface CameraIdentity {
 
   /** Optional provider admission for the independently confirmed recorded-audio write. */
   readonly audioRecordingControlSupported?: boolean;
+
+  /** Preserve the fixed S340 admission diagnostic alongside its control capability. */
+  readonly streamingQualityControlReason?: CameraState["streamingQualityControlReason"];
+
+  /** Session-scoped values expire with live view and are not saved camera settings. */
+  readonly streamingQualityControlScope?: "active_stream";
 
   /** Optional admission for fresh-state-confirmed streaming-quality writes. */
   readonly streamingQualityControlSupported?: boolean;
@@ -511,13 +603,19 @@ export interface CameraIdentity {
   /** Exact-route admission for fresh-state-confirmed sensitivity and HomeBase chime writes. */
   readonly motionSensitivityControlSupported?: boolean;
   readonly motionSensitivitySteps?: number | null;
+
+  /** Mark an opt-in sensitivity transport whose physical behaviour is unconfirmed. */
+  readonly motionSensitivityExperimental?: boolean;
   readonly homebaseChimeControlSupported?: boolean;
 
   /** Opt-in exact T8425/T8426 brightness with a readable baseline; physical behaviour is unconfirmed. */
   readonly lightBrightnessControlSupported?: boolean;
 
-  /** Opt-in exact T8426 manual override with independent setting readback. */
+  /** Opt-in model-qualified manual override with independent setting readback. */
   readonly manualFloodlightControlSupported?: boolean;
+
+  /** Admission category only, never account, route or device identifiers. */
+  readonly manualFloodlightControlReason?: ManualLightControlReason;
 
   /** Native choices for this model, separate from recorded-video resolution. */
   readonly streamingQualityModes?: readonly CameraStreamingQualityMode[];
@@ -536,6 +634,9 @@ export interface CameraIdentity {
 
   /** An admitted one-call NVR route may close an unused HA HLS worker before handoff. */
   readonly hlsIdleHandoverSupported?: boolean;
+
+  /** Exact E340/HB3 route can offer a disabled-by-default, geometry-checked main lens. */
+  readonly mainLensViewSupported?: boolean;
 
 
   /** Optional read-only configuration projection from fresh device inventory. */
@@ -556,8 +657,17 @@ export interface CameraIdentity {
   /** Optional provider admission for live AAC, independent of reported microphone settings. */
   readonly liveAudioSupported?: boolean;
 
+  /** Unconfirmed live audio is offered as a disabled experimental HA entity. */
+  readonly liveAudioExperimental?: boolean;
+
   /** Exact route support for bounded speaker audio, independent of microphone streaming. */
   readonly talkbackSupported?: boolean;
+
+  /** Opt-in live microphone input, separate from prepared speaker uploads. */
+  readonly liveTalkbackSupported?: boolean;
+
+  /** Stable opted-in delivery mode, independent of temporary speaker readiness. */
+  readonly liveTalkbackEnabled?: boolean;
   readonly doorbellSupported: boolean;
   readonly enabled?: boolean | null;
   readonly enableControlSupported?: boolean;
@@ -574,6 +684,9 @@ export interface CameraIdentity {
   readonly cameraLightControlSupported?: boolean;
 
   /** Exact owned opt-in route for experimental stateless light buttons. */
+  /** Offer saved-reply trial buttons only for an authenticated opt-in route. */
+  readonly experimentalQuickResponseSupported?: boolean;
+
   readonly experimentalLightControlSupported?: boolean;
   readonly timedLightControlSupported?: boolean;
   readonly cameraSirenControlSupported?: boolean;

@@ -8,7 +8,10 @@
  * module owns request authentication, response framing, and route selection;
  * it does not parse Mega payloads or open camera sockets.
  */
+import { C31LiveRtc, C31LiveRtcError, c31LiveRtcOfferDiagnostic } from "./stream/c31-live-rtc.js";
+import { validQuickResponseId } from "./provider/quick-responses.js";
 import { SharedLensSnapshotCache, type SharedLens } from "./stream/shared-lens-views.js";
+import { e340MainLensSnapshot } from "./stream/e340-main-lens.js";
 import { rawHistoryStatus, rawHistoryFiles, rawHistoryPrivateFile } from "./diagnostics/raw-history.js";
 import { ParameterCheckError, parameterCheckStages, validateParameterSummary } from "./provider/reported-parameter-check.js";
 import { GeneralRtcPreparationError } from "./provider/provider.js";
@@ -18,9 +21,10 @@ import { NvrLiveControlError, type NvrLiveControl } from "./provider/nvr-live-co
 import { NvrPowerError, type NvrPowerRequest } from "./provider/nvr-power-trial.js";
 import { NvrGuardError, type NvrGuardRequest } from "./provider/nvr-guard-trial.js";
 import { nvrGuardTimeZone } from "./provider/nvr-guard-schedule.js";
-import { T85V0StatusError } from "./provider/t85v0-status.js";
+import { T85V0StatusError, t85v0StatusFailureSummary } from "./provider/t85v0-status.js";
 import { LocalMotionError } from "./stream/local-motion-trial.js";
 import { C31IndexError, parseC31IndexRequest, type C31IndexWindow } from "./stream/c31-recording-index.js";
+import { parseC31ContinuousRequest } from "./stream/c31-continuous-recording.js";
 import { recordingPathDate } from "./mega/push-recording-reference.js";
 import { projectEventPictureSummary } from "./stream/homebase-event-picture.js";
 import { EventNameHistoryError, eventHistoryCursor, eventHistoryId, nextEventHistoryDate, projectEventNameHistorySummary } from "./stream/homebase-event-names.js";
@@ -48,6 +52,7 @@ import { S100SirenTrialError, type S100SirenFailureStage } from "./provider/s100
 import { parseModelControlTrial, closedAlarmStateResult, closedSpotlightStateResult } from "./provider/model-control-trials.js";
 import { s120LightFailureDiagnostic } from "./provider/s120-light-diagnostic.js";
 import { E30LockError } from "./provider/e30-lock-protocol.js";
+import { ManualLightSource } from "./stream/manual-light-source.js";
 import { CameraSettingError, parseCameraSettingChange } from "./provider/camera-settings.js";
 import { validateC31Preference } from "./provider/c31-preferences.js";
 import { SimulatedProvider } from "./provider/simulated-provider.js";
@@ -83,10 +88,30 @@ export class GatewayServer {
   #sampleBundleTransport: (() => void) | null = null;
   readonly #recordings = new RecordingCache();
   readonly #lensSnapshotCache = new SharedLensSnapshotCache();
+  readonly #mainLensSnapshotCache = new SharedLensSnapshotCache(data => e340MainLensSnapshot(data));
   readonly #recordingIndexJobs = new Set<AbortController>();
   readonly #cloudCalendarJobs = new Set<AbortController>();
   readonly #nvrTrialJobs = new Set<AbortController>();
   readonly #speakerJobs = new Map<string, AbortController>();
+  readonly #liveRtc = new C31LiveRtc({
+    admitted: serial => {
+      if (!this.config.experimentalC31LiveTalkback || !this.config.apiToken || !this.provider.streamCameraAudio
+        || !this.state.hasCamera(serial)) return false;
+      const camera = this.state.getCamera(serial);
+      return camera.model === "T817L" && camera.deviceType === 10031 && camera.liveTalkbackEnabled === true
+        && camera.streamSupported && camera.liveAudioSupported === true;
+    },
+    microphoneReady: serial => this.state.hasCamera(serial) && this.state.getCamera(serial).audioSettings?.speakerEnabled === true,
+    source: (serial, input) => this.streams.addTransportClient(serial, input, "compatible"),
+    speaker: (serial, frames, signal) => this.provider.streamCameraAudio!(serial, frames, signal),
+    finished: summary => logger.info("c31_live_talkback_finished", `model=T817L outcome=${summary.outcome}`
+      + ` video_packets=${summary.videoPackets} audio_packets=${summary.audioPackets} microphone_packets=${summary.microphonePackets}`
+      + ` ignored_microphone_packets=${summary.ignoredMicrophonePackets} encoded_frames=${summary.encodedFrames} segments=${summary.microphoneSegments} speaker_failures=${summary.speakerFailures}`),
+  });
+  readonly #manualLightSources = new ManualLightSource(
+    (serial, signal, ready) => this.streams.holdManualLightSource(serial, signal, ready),
+    serial => this.provider.retireManualLightState?.(serial),
+  );
   readonly #recordingJobs = new Map<string, { promise: Promise<Buffer | null>; controller: AbortController; users: Set<ServerResponse> }>();
 
   /**
@@ -124,6 +149,9 @@ export class GatewayServer {
   /** Stop accepting requests, end open responses and wait for the HTTP server to close. */
   async close(): Promise<void> {
     this.#lensSnapshotCache.clear();
+    this.#mainLensSnapshotCache.clear();
+    await this.#manualLightSources.close();
+    await this.#liveRtc.closeAll();
     for (const controller of this.#cloudCalendarJobs) controller.abort();
     for (const controller of this.#nvrTrialJobs) controller.abort();
     for (const controller of this.#recordingIndexJobs) controller.abort();
@@ -276,7 +304,7 @@ export class GatewayServer {
         response.setHeader("cache-control", "no-store");
         if (!this.config.apiToken || !isBearerAuthorized(request.headers.authorization, this.config.apiToken)) return json(response, 401, { stage: "unauthorized" });
         if (request.method !== "POST" || url.search || request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() !== "application/json") return json(response, 400, { stage: "invalid_request" });
-        if (!this.config.experimentalModelControls || !this.provider.readReportedParameters) return json(response, 409, { stage: "disabled" });
+        if (!this.provider.readReportedParameters) return json(response, 409, { stage: "disabled" });
         const controller = new AbortController();
         let timeout = false, dispatched = false;
         const close = (): void => { if (!response.writableFinished) controller.abort(); };
@@ -436,9 +464,10 @@ export class GatewayServer {
         const streamAuthorized =
           request.method === "GET" &&
           segments[1] === "cameras" &&
-          (segments[3] === "live.h264" || segments[3] === "live.ts" || segments[3] === "live-fixed.h264" || segments[3] === "live-movable.h264" || segments[3] === "live-native.annexb" || segments[3] === "live-native.ts") &&
+          (segments[3] === "live.h264" || segments[3] === "live.ts" || segments[3] === "live-main.h264" || segments[3] === "live-fixed.h264" || segments[3] === "live-movable.h264" || segments[3] === "live-native.annexb" || segments[3] === "live-native.ts"
+            || segments[3] === "live-fixed-native.annexb" || segments[3] === "live-movable-native.annexb") &&
           segments.length === 4 &&
-          (segments[3] === "live-native.annexb" || segments[3] === "live-native.ts"
+          (segments[3] === "live-native.annexb" || segments[3] === "live-native.ts" || segments[3] === "live-fixed-native.annexb" || segments[3] === "live-movable-native.annexb"
             ? url.searchParams.getAll(STREAM_TOKEN_QUERY).length === 1
               && validateNativeStreamToken(segments[2]!, url.searchParams.get(STREAM_TOKEN_QUERY), this.config.apiToken)
             : validateStreamToken(segments[2]!, url.searchParams.get(STREAM_TOKEN_QUERY), this.config.apiToken));
@@ -662,12 +691,67 @@ export class GatewayServer {
         }
         return;
       }
+      if (segments[0] === "api" && segments[1] === "cameras" && segments[3] === "live-talkback") {
+        const serial = segments[2]!;
+        if (request.method === "POST" && segments.length === 4) {
+          if (!this.config.experimentalC31LiveTalkback || !this.config.apiToken || !this.state.hasCamera(serial)
+            || this.state.getCamera(serial).liveTalkbackEnabled !== true) return json(response, 409, { error: "Live talkback unavailable" });
+          if (this.#speakerJobs.has(serial) || this.#liveRtc.has(serial)) return json(response, 409, { error: "Camera speaker is busy" });
+          let body: Record<string, unknown>;
+          try { body = await readJson(request, 96 * 1024); }
+          catch { throw new SyntaxError("Invalid live offer"); }
+          if (Object.keys(body).length !== 1 || typeof body.sdp !== "string") throw new SyntaxError("Invalid live offer");
+          let owner: { sessionId: string; sdp: string } | undefined;
+          const disconnected = (): void => {
+            if (owner && !response.writableEnded) void this.#liveRtc.close(serial, owner.sessionId).catch(() => undefined);
+          };
+          response.once("close", disconnected);
+          try {
+            owner = await this.#liveRtc.offer(serial, body.sdp);
+            if (response.destroyed) { await this.#liveRtc.close(serial, owner.sessionId); return; }
+            return json(response, 200, owner);
+          } catch (error) {
+            const stage = error instanceof C31LiveRtcError ? error.code : "negotiation";
+            const detail = error instanceof C31LiveRtcError ? error.detail : undefined;
+            logger.warn("c31_live_talkback_failed", `model=T817L stage=${stage} detail=${detail ?? "none"}`
+              + (stage === "offer" ? ` ${c31LiveRtcOfferDiagnostic(body.sdp as string)}` : ""));
+            return json(response, 409, { error: "Live talkback unavailable", code: stage });
+          }
+          finally { response.off("close", disconnected); }
+        }
+        const id = segments[4];
+        if (segments.length !== 5 || typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id)) throw new SyntaxError("Invalid live session");
+        try {
+          if (request.method === "DELETE") await this.#liveRtc.close(serial, id);
+          else if (request.method === "PATCH") {
+            const body = await readJson(request);
+            if (Object.keys(body).length !== 1 || !("candidate" in body)) throw new SyntaxError("Invalid live candidate");
+            const candidate = body.candidate;
+            if (candidate !== null) {
+              if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) throw new SyntaxError("Invalid live candidate");
+              const fields = candidate as Record<string, unknown>;
+              if (typeof fields.candidate !== "string" || fields.candidate.length > 2048
+                || Object.keys(fields).some(key => !["candidate", "sdpMid", "sdpMLineIndex", "usernameFragment"].includes(key))
+                || fields.sdpMid !== undefined && fields.sdpMid !== null && (typeof fields.sdpMid !== "string" || fields.sdpMid.length > 16)
+                || fields.sdpMLineIndex !== undefined && fields.sdpMLineIndex !== null
+                  && (!Number.isInteger(fields.sdpMLineIndex) || (fields.sdpMLineIndex as number) < 0 || (fields.sdpMLineIndex as number) > 1)) {
+                throw new SyntaxError("Invalid live candidate");
+              }
+            }
+            await this.#liveRtc.candidate(serial, id, candidate as import("werift").RTCIceCandidateInit | null);
+          } else return json(response, 405, { error: "Method not allowed" });
+          return json(response, 200, { ok: true });
+        } catch (error) {
+          if (error instanceof SyntaxError) throw error;
+          return json(response, 409, { error: "Live talkback session unavailable" });
+        }
+      }
       if (request.method === "POST" && segments.length === 4 && segments[0] === "api"
         && segments[1] === "cameras" && segments[3] === "speaker-audio") {
         const serial = segments[2]!;
         if (!this.state.hasCamera(serial)) return json(response, 404, { error: "Camera not found" });
         if (!this.state.getCamera(serial).talkbackSupported || !this.provider.playCameraAudio) return json(response, 409, { error: "Speaker playback unavailable" });
-        if (this.#speakerJobs.has(serial)) return json(response, 409, { error: "Camera speaker is busy" });
+        if (this.#speakerJobs.has(serial) || this.#liveRtc.has(serial)) return json(response, 409, { error: "Camera speaker is busy" });
         if (request.headers["content-type"]?.split(";", 1)[0] !== "audio/aac") throw new SyntaxError("Speaker audio requires audio/aac");
         const controller = new AbortController();
         this.#speakerJobs.set(serial, controller);
@@ -837,7 +921,7 @@ export class GatewayServer {
           json(response, 200, { reportedState: result.reportedState, batteryPercent: result.batteryPercent, physicalConfirmationRequired: true });
         } catch (error) {
           const failure = error instanceof T85V0StatusError ? error : new T85V0StatusError(controller.signal.aborted ? "cancelled" : "session");
-          logger.warn("lock_status_trial_failed", `stage=${failure.stage}${failure.reason ? ` reason=${failure.reason}` : ""}`);
+          logger.warn("lock_status_trial_failed", t85v0StatusFailureSummary(failure));
           if (!response.destroyed) json(response, 409, { stage: failure.stage, ...(failure.reason ? { reason: failure.reason } : {}) });
         } finally {
           controller.abort(); clearTimeout(deadline); response.removeListener("close", abort);
@@ -866,6 +950,35 @@ export class GatewayServer {
         } catch (error) {
           const failure = error instanceof LocalMotionError ? error : new LocalMotionError(controller.signal.aborted ? "cancelled" : "session");
           logger.warn("local_motion_trial_failed", `stage=${failure.stage}`);
+          if (!response.destroyed) json(response, 409, { stage: failure.stage });
+        } finally {
+          controller.abort(); clearTimeout(deadline); response.removeListener("close", abort);
+          request.removeListener("aborted", abort); this.#recordingIndexJobs.delete(controller);
+        }
+        return;
+      }
+      if (request.method === "POST" && segments[0] === "api" && segments[1] === "cameras"
+        && segments[3] === "continuous-recording-trial" && segments.length === 4) {
+        response.setHeader("cache-control", "no-store");
+        if (!this.config.apiToken || !this.config.experimentalModelControls || !this.provider.readC31ContinuousTrial) return json(response, 409, { stage: "admission" });
+        if (!this.state.hasCamera(segments[2]!)) return json(response, 404, { stage: "admission" });
+        if ((request.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase() !== "application/json") return json(response, 400, { stage: "admission" });
+        let begin: number;
+        try { begin = parseC31ContinuousRequest(await readJson(request), Math.floor(Date.now() / 1000)).beginTime; }
+        catch { return json(response, 400, { stage: "admission" }); }
+        if (this.#recordingIndexJobs.size || this.#nvrTrialJobs.size || this.streams.hasActiveSession(segments[2]!)) return json(response, 409, { stage: "busy" });
+        const controller = new AbortController(); this.#recordingIndexJobs.add(controller);
+        const deadline = setTimeout(() => controller.abort(), 90_000);
+        const abort = (): void => { if (!response.writableEnded) controller.abort(); };
+        response.once("close", abort); request.once("aborted", abort);
+        try {
+          const media = await this.provider.readC31ContinuousTrial(segments[2]!, begin, controller.signal);
+          if (controller.signal.aborted || response.destroyed) { media.fill(0); return; }
+          response.setHeader("content-type", "video/mp4"); response.setHeader("content-length", media.length);
+          response.end(media, () => media.fill(0));
+        } catch (error) {
+          const failure = error instanceof C31IndexError ? error : new C31IndexError(controller.signal.aborted ? "cancelled" : "session");
+          logger.warn("continuous_recording_trial_failed", `stage=${failure.stage}`);
           if (!response.destroyed) json(response, 409, { stage: failure.stage });
         } finally {
           controller.abort(); clearTimeout(deadline); response.removeListener("close", abort);
@@ -1100,7 +1213,16 @@ export class GatewayServer {
         const abort = (): void => { if (!response.writableEnded) controller.abort(); };
         response.once("close", abort);
         try {
-          const identity = await this.provider.setCameraSetting(segments[2]!, change, controller.signal);
+          const serial = segments[2]!, camera = this.state.getCamera(serial);
+          const wakeLight = change.setting === "manualFloodlight" && camera.model === "T8113-Z" && camera.deviceType === 8
+            && (camera.manualFloodlightControlReason === "ready" || camera.manualFloodlightControlReason === "state_unavailable");
+          let submitted = false;
+          const write = () => { submitted = true; return this.provider.setCameraSetting!(serial, change, controller.signal); };
+          const identity = wakeLight
+            ? await this.#manualLightSources.run(serial, change.value === true, write, controller.signal).catch(error => {
+                throw error instanceof CameraSettingError ? error : new CameraSettingError(submitted ? "outcome_unknown" : "unavailable");
+              })
+            : await write();
           return json(response, 200, this.state.registerCamera(identity));
         } catch (error) {
           if (error instanceof CameraSettingError) return json(response, error.code === "outcome_unknown" ? 503 : 409, { code: error.code, error: error.message });
@@ -1183,6 +1305,23 @@ export class GatewayServer {
       ) {
         return await this.#cameraPan(request, segments[2]!, response);
       }
+      if (segments[0] === "api" && segments[1] === "cameras" && segments[3] === "quick-responses"
+        && segments.length === 4 && (request.method === "GET" || request.method === "POST")) {
+        if (!this.state.hasCamera(segments[2]!)) return json(response, 404, { error: "Camera not found" });
+        if (!this.config.apiToken || !this.state.getCamera(segments[2]!).experimentalQuickResponseSupported
+          || !this.provider.getQuickResponses || !this.provider.playQuickResponse) {
+          return json(response, 409, { error: "Experimental quick responses unavailable" });
+        }
+        if (request.method === "GET") return json(response, 200, { replies: await this.provider.getQuickResponses(segments[2]!) });
+        const text = await readBody(request);
+        if (text.length > 512 || !/^\s*\{\s*"id"\s*:\s*\d+\s*\}\s*$/.test(text)) {
+          return json(response, 400, { error: "Choose one saved reply" });
+        }
+        const body = JSON.parse(text) as { id: unknown };
+        if (!validQuickResponseId(body.id)) return json(response, 400, { error: "Choose one saved reply" });
+        await this.provider.playQuickResponse(segments[2]!, body.id);
+        return json(response, 200, { outcome: "acknowledged", physicalConfirmationRequired: true });
+      }
       if (
         request.method === "GET" &&
         segments[0] === "api" && segments[1] === "cameras" && segments[3] === "preset-positions" && segments.length === 4
@@ -1255,7 +1394,24 @@ export class GatewayServer {
           segments[3].startsWith("live-native.") ? "native" : "compatible", liveViewMark(url));
       }
       if (request.method === "GET" && segments[0] === "api" && segments[1] === "cameras" && segments.length === 4
-        && ["live-fixed.h264", "live-movable.h264", "snapshot-fixed", "snapshot-movable"].includes(segments[3]!)) {
+        && ["live-main.h264", "snapshot-main"].includes(segments[3]!)) {
+        const serial = segments[2]!;
+        if (!this.state.hasCamera(serial)) return json(response, 404, { error: "Camera not found" });
+        if (!this.provider.mainLensViewAdmitted?.(serial)) return json(response, 409, { error: "Main lens view is unavailable" });
+        if (segments[3] === "snapshot-main") {
+          const snapshot = await this.snapshots.read(serial);
+          const image = snapshot?.info.contentType === "image/jpeg" ? await this.#mainLensSnapshotCache.read(serial,
+            JSON.stringify([snapshot.info.revision, snapshot.info.capturedAt]), snapshot.data, "fixed") : null;
+          if (response.destroyed) return;
+          if (!this.provider.mainLensViewAdmitted?.(serial)) return json(response, 409, { error: "Main lens view is unavailable" });
+          if (!image) return this.#waitingImage(response);
+          response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": image.length, "Cache-Control": "no-store" });
+          response.end(image); return;
+        }
+        return await this.streams.addMainLensClient(serial, response);
+      }
+      if (request.method === "GET" && segments[0] === "api" && segments[1] === "cameras" && segments.length === 4
+        && ["live-fixed.h264", "live-movable.h264", "live-fixed-native.annexb", "live-movable-native.annexb", "snapshot-fixed", "snapshot-movable"].includes(segments[3]!)) {
         const lens: SharedLens = segments[3]!.includes("fixed") ? "fixed" : "movable";
         if (!this.state.hasCamera(segments[2]!)) return json(response, 404, { error: "Camera not found" });
         if (!this.provider.nvrSharedLensViewsAdmitted?.(segments[2]!)) return json(response, 409, { error: "Select the admitted NVR Both view before opening a lens" });
@@ -1267,6 +1423,10 @@ export class GatewayServer {
           if (!image) return this.#waitingImage(response);
           response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": image.length, "Cache-Control": "no-store" });
           response.end(image); return;
+        }
+        if (segments[3]!.endsWith("-native.annexb")) {
+          logger.info("camera_media_request", `model=${safeCameraModel(this.state.getCamera(segments[2]!).model)} operation=lens_view_native lens=${lens}`);
+          return await this.streams.addNativeLensClient(segments[2]!, lens, response);
         }
         return await this.streams.addLensClient(segments[2]!, lens, response);
       }
@@ -1691,14 +1851,14 @@ export class GatewayServer {
   }
 
   async #streamToken(request: IncomingMessage, serial: string, response: ServerResponse): Promise<void> {
-    let profile: ViewerProfile | undefined, requestedAudio: "on" | "off" | undefined, lens: SharedLens | undefined;
+    let profile: ViewerProfile | undefined, requestedAudio: "on" | "off" | undefined, lens: SharedLens | "main" | undefined;
     try { ({ profile, audio: requestedAudio, lens } = await readStreamProfile(request)); }
     catch { return json(response, 400, { error: "Invalid stream profile request" }); }
     if (!this.state.hasCamera(serial)) return json(response, 404, { error: "Camera not found" });
     if (!this.state.getCamera(serial).streamSupported) {
       return json(response, 409, { error: "Livestream control is unavailable for this camera" });
     }
-    if (lens && !this.provider.nvrSharedLensViewsAdmitted?.(serial)) return json(response, 409, { error: "Shared lens views are unavailable" });
+    if (lens && !(lens === "main" ? this.provider.mainLensViewAdmitted?.(serial) : this.provider.nvrSharedLensViewsAdmitted?.(serial))) return json(response, 409, { error: "Shared lens views are unavailable" });
     const expiresAt = Math.floor(Date.now() / 1_000) + STREAM_TOKEN_LIFETIME_SECONDS;
     const token = this.config.apiToken
       ? profile === "native" ? createNativeStreamToken(serial, expiresAt, this.config.apiToken)
@@ -1706,7 +1866,7 @@ export class GatewayServer {
       : null;
     const audio = this.state.getCamera(serial).liveAudioSupported === true
       && (requestedAudio === "on" || requestedAudio === undefined && profile !== "native");
-    const media = lens ? `live-${lens}.h264` : profile === "native" ? audio ? "live-native.ts" : "live-native.annexb" : audio ? "live.ts" : "live.h264";
+    const media = lens ? profile === "native" ? `live-${lens}-native.annexb` : `live-${lens}.h264` : profile === "native" ? audio ? "live-native.ts" : "live-native.annexb" : audio ? "live.ts" : "live.h264";
     const path = `/api/cameras/${encodeURIComponent(serial)}/${media}${token ? `?${STREAM_TOKEN_QUERY}=${encodeURIComponent(token)}` : ""}`;
     if (profile === "native" || lens) response.setHeader("Cache-Control", "no-store");
     return json(response, 200, { path, expiresAt, ...(profile ? { profile } : {}), ...(lens ? { lens } : {}) });
@@ -1894,13 +2054,13 @@ async function readClosedNvrBody(request: IncomingMessage): Promise<Record<strin
   return value as Record<string, unknown>;
 }
 
-async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(request: IncomingMessage, maximumBytes = 16_384): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let length = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     length += buffer.length;
-    if (length > 16_384) throw new Error("Request body is too large");
+    if (length > maximumBytes) throw new Error("Request body is too large");
     chunks.push(buffer);
   }
   if (chunks.length === 0) return {};
@@ -1917,7 +2077,7 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
 interface StreamRequest {
   readonly profile: ViewerProfile | undefined;
   readonly audio: "on" | "off" | undefined;
-  readonly lens?: SharedLens;
+  readonly lens?: SharedLens | "main";
 }
 
 async function readStreamProfile(request: IncomingMessage): Promise<StreamRequest> {
@@ -1958,8 +2118,9 @@ async function readStreamProfile(request: IncomingMessage): Promise<StreamReques
   if (profile !== undefined && profile !== "native" && profile !== "compatible") throw new SyntaxError("Invalid stream profile");
   if (audio !== undefined && audio !== "on" && audio !== "off") throw new SyntaxError("Invalid stream profile");
   const lens = fields.get("lens");
-  if (lens !== undefined && lens !== "fixed" && lens !== "movable") throw new SyntaxError("Invalid lens");
-  if (lens && (profile === "native" || audio === "on")) throw new SyntaxError("Lens views are compatible video only");
+  if (lens !== undefined && lens !== "fixed" && lens !== "movable" && lens !== "main") throw new SyntaxError("Invalid lens");
+  if (lens && audio === "on") throw new SyntaxError("Lens views are video only");
+  if (lens === "main" && profile === "native") throw new SyntaxError("Main lens views require the checked crop");
   return { profile, audio, ...(lens ? { lens } : {}) };
 }
 

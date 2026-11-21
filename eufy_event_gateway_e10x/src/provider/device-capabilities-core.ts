@@ -12,7 +12,8 @@ import { CAMERA_CAPABILITY_CORE, catalogueIntegrationStatus, hasMainsBatterySent
 import type { CoreCapabilityEntry } from "./device-capability-core.js";
 import { DOORBELL_CAPABILITY_CORE } from "./doorbell-capability-core.js";
 import { HOMEBASE_CAPABILITY_CORE, HOMEBASE_DEVICE_TYPES } from "./homebase-capability-core.js";
-import { SENSOR_CAPABILITY_CORE, SENSOR_DEVICE_TYPES } from "./sensor-capability-core.js";
+import { ENTRY_SENSOR_HEALTH_CAPABILITY_CORE, SENSOR_CAPABILITY_CORE, SENSOR_DEVICE_TYPES } from "./sensor-capability-core.js";
+import { isT8442Camera } from "./t8442-profile.js";
 import { CARE_MONITOR_CAPABILITY_ROWS, isCareBabyMonitor } from "./care-monitor.js";
 
 /** Inventory shape sufficient for baseline family recognition. */
@@ -43,6 +44,7 @@ export function isSupportedCameraType(device: { readonly category: string | null
   if (device.model.toUpperCase() === "T8404" || device.deviceType === 314) {
     return device.model.toUpperCase() === "T8404" && device.deviceType === 314;
   }
+  if (device.model.toUpperCase() === "T8442" || device.deviceType === 46) return isT8442Camera(device);
   if (megaDeviceRole(device.deviceType) !== "camera") return false;
 
   if (device.deviceType === 37) return device.model.toUpperCase() === "T8422";
@@ -68,6 +70,7 @@ export function cameraDetectionKinds(
 ): DetectionKind[] | undefined {
   if (device.category !== "eufy_security") return undefined;
   const model = device.model.toUpperCase();
+  if (isT8442Camera(device)) return ["motion", "person", "pet", "vehicle"];
   if (model === "T81A0" && device.deviceType === 10005 && homeBaseAttached === true) {
     return ["motion", "person", "stranger", "pet", "vehicle", "dog", "crying", "sound"];
   }
@@ -109,7 +112,7 @@ export function describeCameraCapabilities(device: CapabilityInventoryRow, optio
       : KNOWN_CAMERA_DEVICE_TYPES.has(device.deviceType ?? -1) ? "catalogued-camera-type"
         : "unrecognized-camera-type";
   const capabilities: CameraCapability[] = [];
-  const mainsSentinel = hasMainsBatterySentinel(device.model);
+  const mainsSentinel = hasMainsBatterySentinel(device.model) || isT8442Camera(device);
   if (acceptedAsCamera) {
     capabilities.push(
       { id: "motion", kind: "event", unit: null, evidence: "gateway" },
@@ -229,9 +232,11 @@ function describeHomeBaseFamily(
 function describeSensorFamily(device: CapabilityInventoryRow): DeviceCapabilityManifest {
   const observed = new Set(device.paramTypes);
   const motionType = device.deviceType === 10 || device.deviceType === 127;
-  const supported = motionType || [1101, 1550, 1551].some((id) => observed.has(id));
-  const mapped = new Set(SENSOR_CAPABILITY_CORE.flatMap(({ evidenceParamIds }) => evidenceParamIds));
-  const matrix = SENSOR_CAPABILITY_CORE.map((entry) => {
+  const entrySensor = device.model === "T8900" && device.deviceType === 2;
+  const catalogue = [...SENSOR_CAPABILITY_CORE, ...(entrySensor ? ENTRY_SENSOR_HEALTH_CAPABILITY_CORE : [])];
+  const supported = motionType || [1101, 1550, 1551, ...(entrySensor ? [1131, 1552] : [])].some((id) => observed.has(id));
+  const mapped = new Set(catalogue.flatMap(({ evidenceParamIds }) => evidenceParamIds));
+  const matrix = catalogue.map((entry) => {
     if (entry.id === "sensor.motion_event" && !motionType) {
       return { ...evaluateCoreEntry(entry, observed, false, false), deviceEvidence: "requires-live-proof" as const };
     }

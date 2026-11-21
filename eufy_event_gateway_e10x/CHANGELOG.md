@@ -1,6 +1,13 @@
 # Changelog
 
-Experimental E10 build of eufy-mega-security (base 0.1.259).
+Experimental E10 build of eufy-mega-security (base 0.1.275).
+
+## 0.1.275.1 (21 Nov 2026)
+
+- **Rebased on upstream 0.1.275** (from 0.1.259): picks up 16 upstream releases of fixes, including upstream's own E10 work (relay permission renewal, keepalive profile, keeping connected E10 video after a signalling hangup). Upstream still documents the E10 five-minute stop as unresolved, so the call rollover here is unchanged.
+- All E10 options are unchanged and keep their defaults. With call rollover on, a signalling hangup still ends the call so the next call takes over (as before); with it off, upstream's keep-video-after-hangup applies.
+- Route log now also runs alongside upstream's peer-evidence tracking.
+- Not yet hardware-tested on this base: check the stream for 15+ min after updating (rollover lines in the log), and roll back if anything regresses.
 
 ## 0.1.259.8 (20 Nov 2026)
 

@@ -1,13 +1,17 @@
 /**
- * Defines reviewed sensitivity, live quality, chime and opt-in light settings for exact routes.
+ * Defines reviewed sensitivity, live quality, chime and opt-in camera settings for exact routes.
  * The provider owns leases, network reads and state publication. This module
  * owns native mappings and the single-write confirmation lifecycle consumed
  * by HTTP, PPCS and the Home Assistant settings boundary.
  */
 import type { ModelControlRoute } from "./model-control-trials.js";
+import { isS340LiveQualityRoute, readS340LiveQuality } from "./s340-live-quality.js";
 
 /** Closed absolute requests never carry arbitrary native command identifiers. */
 export type CameraSettingChange =
+  | { readonly setting: "cameraEnabled"; readonly value: boolean }
+  | { readonly setting: "audioRecording"; readonly value: boolean }
+  | { readonly setting: "aiTracking"; readonly value: boolean }
   | { readonly setting: "streamingQuality"; readonly value: number }
   | { readonly setting: "motionSensitivity"; readonly value: number }
   | { readonly setting: "motionDetection"; readonly value: boolean }
@@ -19,7 +23,10 @@ export type CameraSettingChange =
 export interface CameraSettingProfile {
   readonly readParam: number;
   readonly command: number;
-  readonly form: "binary" | "payload" | "control" | "manual-light" | "motion-control" | "solo-sensitivity" | "solo-quality";
+  readonly form: "binary" | "payload" | "control" | "manual-light" | "attached-light" | "motion-control" | "solo-sensitivity" | "solo-quality" | "attached-quality" | "privacy" | "attached-privacy" | "attached-audio" | "attached-tracking";
+
+  /** Require authenticated opt-in while the exact transport awaits hardware confirmation. */
+  readonly experimental?: true;
 
   /** Least-sensitive first; absent for boolean controls. */
   readonly ladder?: readonly number[];
@@ -47,7 +54,7 @@ export function parseCameraSettingChange(value: unknown): CameraSettingChange {
   if (Object.keys(row).length !== 2 || !Object.hasOwn(row, "setting") || !Object.hasOwn(row, "value")) throw new SyntaxError("Invalid camera setting");
   if (row.setting === "streamingQuality" && typeof row.value === "number" && Number.isInteger(row.value) && row.value >= 0 && row.value <= 3) return { setting: row.setting, value: row.value };
   if (row.setting === "lightBrightness" && typeof row.value === "number" && Number.isInteger(row.value) && row.value >= 1 && row.value <= 100) return { setting: row.setting, value: row.value };
-  if ((row.setting === "homebaseChime" || row.setting === "manualFloodlight" || row.setting === "motionDetection") && typeof row.value === "boolean") return { setting: row.setting, value: row.value };
+  if ((row.setting === "cameraEnabled" || row.setting === "audioRecording" || row.setting === "aiTracking" || row.setting === "homebaseChime" || row.setting === "manualFloodlight" || row.setting === "motionDetection") && typeof row.value === "boolean") return { setting: row.setting, value: row.value };
   if (row.setting === "motionSensitivity" && typeof row.value === "number" && Number.isInteger(row.value) && row.value >= 1 && row.value <= 7) {
     return { setting: row.setting, value: row.value };
   }
@@ -55,6 +62,18 @@ export function parseCameraSettingChange(value: unknown): CameraSettingChange {
 }
 
 function nativeProfile(model: string, type: number | null, standalone: boolean, setting: CameraSettingChange["setting"]): CameraSettingProfile | null {
+  if (model === "T8171" && type === 88 && !standalone) {
+    if (setting === "cameraEnabled") return { readParam: 6250, command: 1350, form: "attached-privacy", experimental: true };
+    if (setting === "audioRecording") return { readParam: 1288, command: 1350, form: "attached-audio", experimental: true };
+    if (setting === "aiTracking") return { readParam: 6016, command: 1700, form: "attached-tracking", experimental: true };
+  }
+  if (setting === "audioRecording" || setting === "aiTracking") return null;
+  if (setting === "cameraEnabled") return model === "T8110" && type === 10035
+    ? standalone ? { readParam: 6250, command: 1350, form: "privacy" }
+      : { readParam: 1035, command: 1035, form: "binary", experimental: true } : null;
+  if (setting === "streamingQuality" && model === "T8170" && type === 48 && !standalone) {
+    return { readParam: 2730, command: 1350, form: "attached-quality" };
+  }
   if (setting === "streamingQuality") return standalone && model === "T8134" && type === 63
     ? { readParam: 1020, command: 1700, form: "solo-quality" } : null;
   if (setting === "motionSensitivity" && standalone && model === "T8134" && type === 63) {
@@ -63,6 +82,9 @@ function nativeProfile(model: string, type: number | null, standalone: boolean, 
   const floodlight = standalone && ((model === "T8425" && type === 47) || (model === "T8426" && type === 87));
   if (setting === "motionDetection") return floodlight ? { readParam: 6040, command: 1700, form: "motion-control" } : null;
   if (setting === "motionSensitivity" && floodlight) return { readParam: 6041, command: 1700, form: "motion-control", ladder: [1, 2, 3, 4, 5] };
+  if (setting === "manualFloodlight" && !standalone && model === "T8113-Z" && type === 8) {
+    return { readParam: 1400, command: 1400, form: "attached-light", experimental: true };
+  }
   if (setting === "manualFloodlight") return standalone && model === "T8426" && type === 87 ? { readParam: 1400, command: 1700, form: "manual-light" } : null;
   if (setting === "lightBrightness") return standalone && ((model === "T8425" && type === 47) || (model === "T8426" && type === 87))
     ? { readParam: 1401, command: 1401, form: "binary" } : null;
@@ -77,8 +99,24 @@ function nativeProfile(model: string, type: number | null, standalone: boolean, 
 
 /** Admit exact reviewed transport families, excluding nearby model variants; the provider owns opt-in and account gates. */
 export function cameraSettingProfile(route: ModelControlRoute, setting: CameraSettingChange["setting"]): CameraSettingProfile | null {
+  if (route.model === "T8110" && setting === "cameraEnabled" && route.homeBaseAttached) {
+    return route.deviceType === 10035 && !route.selfPeer && route.peerModel === "T8030"
+      && Number.isInteger(route.channel) && route.channel! >= 1 && route.channel! <= 255
+      ? nativeProfile(route.model, route.deviceType, false, setting) : null;
+  }
+  if (route.model === "T8171" && ["cameraEnabled", "audioRecording", "aiTracking"].includes(setting)) {
+    return route.deviceType === 88 && route.homeBaseAttached && !route.selfPeer && route.peerModel === "T8030"
+      && route.channel === 1 ? nativeProfile(route.model, route.deviceType, false, setting) : null;
+  }
+  if ((route.model === "T8170" || route.deviceType === 48) && setting === "streamingQuality"
+    && !isS340LiveQualityRoute(route)) return null;
   if (route.model === "T8134" && route.peerModel !== "T8134") return null;
   if (!Number.isInteger(route.channel) || route.channel! < 0 || route.channel! > 255) return null;
+  if (route.homeBaseAttached && !route.selfPeer && route.peerModel === "T8010"
+    && route.model === "T8113-Z" && route.deviceType === 8 && setting === "motionSensitivity") {
+    const profile = nativeProfile(route.model, route.deviceType, false, setting);
+    return profile ? { ...profile, experimental: true } : null;
+  }
   if (route.homeBaseAttached ? route.selfPeer || route.peerModel !== "T8030" : !route.selfPeer || route.channel !== 0) return null;
   return nativeProfile(route.model, route.deviceType, !route.homeBaseAttached, setting);
 }
@@ -90,11 +128,15 @@ export function readCameraSetting(
 ): number | boolean | undefined {
   const profile = nativeProfile(model, type, standalone, setting);
   if (!profile) return undefined;
+  if (profile.form === "attached-quality") return readS340LiveQuality(params)?.quality;
   const rows = params.filter(row => row.param_type === profile.readParam);
   if (rows.length !== 1) return undefined;
   const raw = rows[0]!.param_value;
   const value = typeof raw === "string" && /^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : raw;
   if (typeof value !== "number" || !Number.isSafeInteger(value)) return undefined;
+  if (setting === "cameraEnabled") return value === 0 || value === 1 ? value === 0 : undefined;
+  if (setting === "audioRecording") return value === 0 || value === 1 ? value === 0 : undefined;
+  if (setting === "aiTracking") return value === 0 || value === 1 ? value === 1 : undefined;
   if (setting === "streamingQuality") return value >= 0 && value <= 3 ? value : undefined;
   if (setting === "homebaseChime" || setting === "manualFloodlight" || setting === "motionDetection") return value === 0 || value === 1 ? value === 1 : undefined;
   if (setting === "lightBrightness") return value >= 1 && value <= 100 ? value : undefined;
@@ -105,7 +147,22 @@ export function readCameraSetting(
 /** Convert one validated HA step to native bytes, rejecting profile-specific excess values. */
 export function cameraSettingWireValue(profile: CameraSettingProfile, change: CameraSettingChange): number {
   parseCameraSettingChange(change);
+  if (change.setting === "cameraEnabled") {
+    if (profile.readParam === 1035 && profile.command === 1035 && profile.form === "binary"
+      && profile.experimental === true && !profile.ladder) return change.value ? 0 : 1;
+    if (profile.readParam !== 6250 || profile.command !== 1350 || !["privacy", "attached-privacy"].includes(profile.form) || profile.ladder) throw new CameraSettingError("unavailable");
+    return change.value ? 0 : 1;
+  }
+  if (change.setting === "audioRecording") {
+    if (profile.readParam !== 1288 || profile.command !== 1350 || profile.form !== "attached-audio" || profile.ladder) throw new CameraSettingError("unavailable");
+    return change.value ? 0 : 1;
+  }
+  if (change.setting === "aiTracking") {
+    if (profile.readParam !== 6016 || profile.command !== 1700 || profile.form !== "attached-tracking" || profile.ladder) throw new CameraSettingError("unavailable");
+    return change.value ? 1 : 0;
+  }
   if (change.setting === "streamingQuality") {
+    if (profile.form === "attached-quality" && profile.readParam === 2730 && profile.command === 1350 && !profile.ladder) return change.value;
     if (profile.readParam !== 1020 || profile.command !== 1700 || profile.form !== "solo-quality" || profile.ladder) throw new CameraSettingError("unavailable");
     return change.value;
   }
@@ -114,7 +171,9 @@ export function cameraSettingWireValue(profile: CameraSettingProfile, change: Ca
     return change.value ? 1 : 0;
   }
   if (change.setting === "manualFloodlight") {
-    if (profile.readParam !== 1400 || profile.command !== 1700 || profile.form !== "manual-light" || profile.ladder) throw new CameraSettingError("unavailable");
+    const standalone = profile.command === 1700 && profile.form === "manual-light";
+    const attached = profile.command === 1400 && profile.form === "attached-light" && profile.experimental === true;
+    if (profile.readParam !== 1400 || (!standalone && !attached) || profile.ladder) throw new CameraSettingError("unavailable");
     return change.value ? 1 : 0;
   }
   if (change.setting === "homebaseChime") {
@@ -145,6 +204,9 @@ export interface ConfirmedCameraSettingOperation {
   /** Absolute epoch-millisecond deadline; HA allows a longer HTTP timeout. */
   readonly deadline: number;
   readonly wait?: () => Promise<void>;
+
+  /** Absolute light writes require a new device notification even when the cloud mirror already matches. */
+  readonly alwaysWrite?: true;
 }
 
 /** Submit once from a fresh baseline, retaining confirmed state on every clean rejection. */
@@ -165,7 +227,7 @@ export async function runConfirmedCameraSetting(operation: ConfirmedCameraSettin
   try {
     check(); const baseline = await bounded(operation.read()); check();
     if (baseline === undefined) throw new CameraSettingError("unavailable");
-    if (baseline === expected) return;
+    if (baseline === expected && operation.alwaysWrite !== true) return;
     await bounded(operation.write(() => { check(); if (operation.deadline - Date.now() < 20_000) throw new CameraSettingError("unavailable"); dispatched = true; }));
     check();
     if (!dispatched) throw new CameraSettingError("unavailable");

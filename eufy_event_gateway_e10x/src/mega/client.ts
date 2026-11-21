@@ -10,6 +10,7 @@
  * SSE, or the PPCS packet stream. Keeping those concerns out of this class is
  * what makes the Mega layer reusable by a probe or another application.
  */
+import { EventImageKeyUnavailableError } from "./event-image-key-error.js";
 import { observeRawFetch } from "../diagnostics/raw-network.js";
 import { ParameterCheckError, projectReportedParameters, type ParameterCheckModel, type ParameterCheckSummary } from "../provider/reported-parameter-check.js";
 import { MEDIA_HOST, MEDIA_OBJECT_HOST, MediaHttpError, mediaRequestDiagnostic } from "./media-request-diagnostic.js";
@@ -242,6 +243,9 @@ export class MegaClient {
     this.#identityFlights.clear();
     this.#identityRecoveryFlights.clear();
   }
+
+  /** Return the signed-in user's opaque playback identity without authentication or token exposure. */
+  authenticatedUserId(): string | null { return this.isAuthenticated ? this.#session!.userId : null; }
 
   /** Check the current authenticated user without exposing stored account identity. */
   isAuthenticatedUser(userId: string): boolean {
@@ -866,10 +870,12 @@ export class MegaClient {
    * persists keys; response strings remain subject to JavaScript heap cleanup.
    */
   async getEventImageKey(keyId: number, ownerId: string): Promise<Buffer> {
-    if (!this.isAuthenticated || !Number.isInteger(keyId) || keyId < 2 || keyId > 255 ||
-      !ownerId || ownerId !== this.#session!.userId) {
-      throw new Error("Event picture key unavailable");
+    if (!this.isAuthenticated) throw new EventImageKeyUnavailableError("unauthenticated");
+    if (!Number.isInteger(keyId) || keyId < 2 || keyId > 255) {
+      throw new EventImageKeyUnavailableError("invalid_selector");
     }
+    if (!ownerId) throw new EventImageKeyUnavailableError("owner_missing");
+    if (ownerId !== this.#session!.userId) throw new EventImageKeyUnavailableError("owner_mismatch");
     const token = this.#session!.authToken;
     const signal = this.#requestLifetime.signal;
     let decoded: unknown;
@@ -887,14 +893,19 @@ export class MegaClient {
       this.#session.userId !== ownerId) {
       throw new Error("Event picture key session changed");
     }
-    if (!isRecord(decoded) || !Array.isArray(decoded.simple_security_keys) || decoded.simple_security_keys.length > 256) {
-      throw new Error("Event picture key unavailable");
+    if (!isRecord(decoded) || !Object.hasOwn(decoded, "simple_security_keys")) {
+      throw new EventImageKeyUnavailableError("key_list_missing");
+    }
+    if (!Array.isArray(decoded.simple_security_keys) || decoded.simple_security_keys.length > 256) {
+      throw new EventImageKeyUnavailableError("key_list_invalid");
     }
     const matches = decoded.simple_security_keys.filter((entry: unknown) =>
       isRecord(entry) && Number.isInteger(entry.pincode_id) && entry.pincode_id === keyId);
-    const value: unknown = matches.length === 1 ? matches[0].private_key : undefined;
+    if (!matches.length) throw new EventImageKeyUnavailableError("key_missing");
+    if (matches.length !== 1) throw new EventImageKeyUnavailableError("key_ambiguous");
+    const value: unknown = matches[0].private_key;
     if (typeof value !== "string" || !/^[a-fA-F0-9]{64}$/.test(value)) {
-      throw new Error("Event picture key unavailable");
+      throw new EventImageKeyUnavailableError("key_material_unavailable");
     }
     return Buffer.from(value, "hex");
   }
@@ -1024,24 +1035,32 @@ export class MegaClient {
    * Explicit overrides skip discovery. Queueing, discovery and signing share a
    * ten-second deadline, and a replaced session or failed discovery cannot send
    * its token to a newly discovered host. Account domains remain unchanged.
+   * Fixed failure reasons preserve the last attempted queue, region, request or
+   * response-body boundary without retaining an error message or extending it.
    */
   async nvrSignallingContext(station: string, region: "auto" | "us" | "eu" | "ie", cancellation: AbortSignal): Promise<NvrSignallingContext> {
     this.#requireAuthentication();
     const session = this.#session!;
     const deadline = AbortSignal.any([cancellation, AbortSignal.timeout(10_000)]);
+    let phase: "queue" | "region" | "request" | "body" = "queue";
+    const failure = (): NvrTrialError => new NvrTrialError(cancellation.aborted ? "cancelled" : "sign",
+      cancellation.aborted ? "unspecified" : `sign_${phase}_${deadline.aborted ? "timeout" : "failed"}`);
     const pending = this.#enqueue(async lifetime => {
       const signal = AbortSignal.any([lifetime, deadline]); signal.throwIfAborted();
       try {
+        phase = "region";
         const selected = region === "auto" ? await discoverNvrServiceRegion(this.#fetch, this.#country, signal) : region;
         signal.throwIfAborted();
         if (this.#session !== session) throw new NvrTrialError("cancelled");
         const host = selected === "us" ? "security-smart.eufylife.com" : `security-smart-${selected}.eufylife.com`;
+        phase = "request";
         const response = await this.#fetch(`https://${host}/v1/smart/nvr/ws/sign?station_sn=${encodeURIComponent(station)}`, {
           headers: { "app-name": "eufy_mega", "model-type": "WEB", "web-country": this.#country.toUpperCase(),
             gtoken: megaUserToken(session.userId), "x-auth-token": session.authToken, authorization: session.authToken },
           redirect: "manual", signal,
         });
         if (!response.ok) { await response.body?.cancel(); throw new NvrTrialError("region_or_authorization_rejected", "unspecified", response.status); }
+        phase = "body";
         const value: unknown = JSON.parse((await readBoundedResponse(response, 65536, signal)).toString("utf8"));
         if (!isRecord(value) || value.code !== 0 || typeof value.data !== "string" || !value.data.length || value.data.length > 8192) {
           throw new NvrTrialError("region_or_authorization_rejected", "unspecified", response.status);
@@ -1050,12 +1069,12 @@ export class MegaClient {
         return { host, region: selected.toUpperCase() as "US" | "EU" | "IE", authToken: session.authToken,
           gtoken: megaUserToken(session.userId), sign: value.data };
       } catch (error) {
-        throw error instanceof NvrTrialError ? error : new NvrTrialError(cancellation.aborted ? "cancelled" : "sign");
+        throw error instanceof NvrTrialError ? error : failure();
       }
     });
     return await new Promise<NvrSignallingContext>((resolve, reject) => {
       const abort = (): void => { deadline.removeEventListener("abort", abort);
-        reject(new NvrTrialError(cancellation.aborted ? "cancelled" : "sign")); };
+        reject(failure()); };
       deadline.addEventListener("abort", abort, { once: true });
       void pending.then(resolve, reject).finally(() => deadline.removeEventListener("abort", abort));
       if (deadline.aborted) abort();

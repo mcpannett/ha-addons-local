@@ -9,6 +9,7 @@
  * prevents the HTTP and Eufy layers from drifting apart.
  */
 import { resolve } from "node:path";
+import { parseHomeBaseAddresses, type HomeBaseAddress } from "./provider/homebase-address.js";
 import { e10LocalKeyConfig } from "./e10-local-key.js";
 
 /** Fully validated settings used by the running gateway process. */
@@ -20,6 +21,9 @@ export interface GatewayConfig {
   readonly streamGraceMilliseconds: number;
   readonly maxStreamSeconds: number;
   readonly apiToken: string | null;
+
+  /** Optional per-station LAN destinations, with existing peer authentication retained. */
+  readonly homeBaseLocalAddresses?: readonly HomeBaseAddress[];
 
   /** Opt-in private evidence session; requires bearer authentication even on loopback. */
   readonly captureFailedEventImages: boolean;
@@ -35,6 +39,9 @@ export interface GatewayConfig {
 
   /** Default-off official-model control trials, requiring bearer authentication. */
   readonly experimentalModelControls: boolean;
+
+  /** Default-off single recovery of an acknowledged silent HB2 child start. */
+  readonly experimentalHb2StartupRecovery: boolean;
 
   /** Default-off E30 MQTT state and controls, requiring bearer authentication. */
   readonly experimentalE30Locks: boolean;
@@ -56,6 +63,9 @@ export interface GatewayConfig {
 
   /** Default-off owner-account portal RTC clip, isolated from normal media routes. */
   readonly experimentalGeneralRtc: boolean;
+
+  /** Default-off browser microphone path on the exact standalone C31. */
+  readonly experimentalC31LiveTalkback?: boolean;
 
   /** Default-off download of existing cloud recordings with explicit private-media consent. */
   readonly experimentalCloudRecordings: boolean;
@@ -103,12 +113,16 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Gatewa
   if (experimentalHomeBaseEventImages && !apiToken) throw new Error("Experimental HomeBase picture recovery requires EUFY_GATEWAY_API_TOKEN");
   const captureFailedEventImages = captureBoolean(environment.EUFY_GATEWAY_CAPTURE_FAILED_EVENT_IMAGES);
   const experimentalModelControls = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_MODEL_CONTROLS, "EUFY_GATEWAY_EXPERIMENTAL_MODEL_CONTROLS");
+  const experimentalHb2StartupRecovery = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_HB2_STARTUP_RECOVERY, "EUFY_GATEWAY_EXPERIMENTAL_HB2_STARTUP_RECOVERY");
+  if (experimentalHb2StartupRecovery && !apiToken) throw new Error("Experimental HB2 startup recovery requires EUFY_GATEWAY_API_TOKEN");
   const experimentalE30Locks = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_E30_LOCKS, "EUFY_GATEWAY_EXPERIMENTAL_E30_LOCKS");
   if (experimentalE30Locks && !apiToken) throw new Error("Experimental E30 locks require EUFY_GATEWAY_API_TOKEN");
   const experimentalDoorbellRtc = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_DOORBELL_RTC, "EUFY_GATEWAY_EXPERIMENTAL_DOORBELL_RTC");
   if (experimentalDoorbellRtc && !apiToken) throw new Error("Experimental doorbell video requires EUFY_GATEWAY_API_TOKEN");
   const experimentalGeneralRtc = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_GENERAL_RTC, "EUFY_GATEWAY_EXPERIMENTAL_GENERAL_RTC");
   if (experimentalGeneralRtc && !apiToken) throw new Error("Experimental general video requires EUFY_GATEWAY_API_TOKEN");
+  const experimentalC31LiveTalkback = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_C31_LIVE_TALKBACK, "EUFY_GATEWAY_EXPERIMENTAL_C31_LIVE_TALKBACK");
+  if (experimentalC31LiveTalkback && !apiToken) throw new Error("Live talkback requires EUFY_GATEWAY_API_TOKEN");
   const experimentalCloudRecordings = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_CLOUD_RECORDINGS, "EUFY_GATEWAY_EXPERIMENTAL_CLOUD_RECORDINGS");
   if (experimentalCloudRecordings && !apiToken) throw new Error("Experimental cloud recordings require EUFY_GATEWAY_API_TOKEN");
   const experimentalNvrControls = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_NVR_CONTROLS, "EUFY_GATEWAY_EXPERIMENTAL_NVR_CONTROLS");
@@ -146,6 +160,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Gatewa
   return {
     host,
     port: positiveInteger(environment.EUFY_GATEWAY_PORT, 3218),
+    homeBaseLocalAddresses: parseHomeBaseAddresses(environment.EUFY_GATEWAY_HOMEBASE_LOCAL_ADDRESSES),
     dataDirectory: resolve(environment.EUFY_GATEWAY_DATA_DIR ?? "./data"),
     provider,
     streamGraceMilliseconds: positiveInteger(environment.EUFY_GATEWAY_STREAM_GRACE_SECONDS, 10) * 1_000,
@@ -156,6 +171,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Gatewa
     experimentalHomeBaseEventImages,
     experimentalHomeBaseEventNames,
     experimentalModelControls,
+    experimentalHb2StartupRecovery,
     experimentalE30Locks,
     experimentalNvrLive,
     experimentalT8420Live,
@@ -163,6 +179,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Gatewa
     experimentalNvrControls,
     experimentalDoorbellRtc,
     experimentalGeneralRtc,
+    experimentalC31LiveTalkback,
     experimentalCloudRecordings,
     experimentalFixedH265Resolution,
     experimentalLowCpuH265Conversion,

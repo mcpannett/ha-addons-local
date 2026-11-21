@@ -10,6 +10,8 @@ export interface PushRecordingReference {
 
   /** Opaque station database identity, never interpreted as a time or sequence. */
   readonly id: string;
+
+  /** Exact opaque path used only for matching the station history row, never fetched. */
   readonly storagePath: string;
 
   /** Camera trigger clock used for freshness and rejecting an explicitly older visit. */
@@ -18,6 +20,68 @@ export interface PushRecordingReference {
 
 /** Closed shape failures, with no reference values or device identities. */
 export type PushRecordingReferenceProblem = "id_absent" | "id_invalid" | "path_absent" | "path_unsupported" | "time_absent" | "time_invalid";
+
+/**
+ * Closed, value-free reference diagnostics retained by the notification normalizer.
+ * Layout tokens describe field types only. The provider may log them when exact
+ * name recovery is refused, without retaining a path, ID, clock or person name.
+ */
+export interface PushRecordingReferenceShape {
+  readonly pathShape: string;
+  readonly calendar: "supported" | "unsupported";
+  readonly clock: "absent" | "milliseconds" | "seconds" | "invalid";
+}
+
+/** Describe the same innermost payload without changing reference admission. */
+export function pushRecordingReferenceShape(payload: Record<string, unknown>): PushRecordingReferenceShape {
+  const path = payload.file_path;
+  let pathShape = "absent";
+  if (path !== undefined && path !== null) {
+    if (typeof path !== "string") pathShape = "not_string";
+    else if (path.length === 0) pathShape = "empty";
+    else if (path.length > 1024) pathShape = "too_long";
+    else if (/[\s\x00-\x1f\x7f]/u.test(path)) pathShape = "invalid_characters";
+    else {
+      const parts = path.split("/");
+      if (parts.length > 12) pathShape = "too_many_segments";
+      else pathShape = parts.map((part, index) => {
+        if (index === 0 && part === "") return "absolute";
+        if (part === "zx") return "zx";
+        if (/^hdd_data[0-9]+$/.test(part)) return "storage";
+        if (/^Camera[0-9]+$/.test(part)) return part.length === 7 ? "camera1" : part.length === 8 ? "camera2" : "camera_other";
+        if (/^[0-9]{6}$/.test(part)) return "digits6";
+        if (/^[0-9]{8}$/.test(part)) return "digits8";
+        if (/^[0-9]{14}$/.test(part)) return "digits14";
+        if (/^[0-9]{14}\.zxvideo$/.test(part)) return "video14";
+        if (part.endsWith(".zxvideo")) return "video_other";
+        return "other";
+      }).join(".");
+    }
+  }
+  const trigger = payload.trigger_time;
+  const clock = trigger === undefined || trigger === null ? "absent"
+    : typeof trigger !== "number" || !Number.isSafeInteger(trigger) ? "invalid"
+      : trigger >= 1_000_000_000_000 && trigger <= 9_999_999_999_999 ? "milliseconds"
+        : trigger >= 1_000_000_000 && trigger <= 9_999_999_999 ? "seconds" : "invalid";
+  return Object.freeze({ pathShape, calendar: recordingPathDate(path) === null ? "unsupported" : "supported", clock });
+}
+
+/**
+ * Format only validated field-shape categories for a failed picture recovery.
+ * Notification values and paths never cross this logging boundary. Unknown or
+ * hand-constructed event fields stay opaque rather than becoming log content.
+ */
+export function pushRecordingReferenceDiagnostic(problem: unknown, shape?: PushRecordingReferenceShape): string {
+  const reason = ["id_absent", "id_invalid", "path_absent", "path_unsupported", "time_absent", "time_invalid"].includes(problem as string)
+    ? String(problem) : "unknown";
+  const tokens = new Set(["absolute", "zx", "storage", "camera1", "camera2", "camera_other", "digits6", "digits8",
+    "digits14", "video14", "video_other", "other", "absent", "not_string", "empty", "too_long", "invalid_characters", "too_many_segments"]);
+  const parts = typeof shape?.pathShape === "string" ? shape.pathShape.split(".") : [];
+  const path = parts.length > 0 && parts.length <= 12 && parts.every(part => tokens.has(part)) ? parts.join(".") : "unknown";
+  const calendar = ["supported", "unsupported"].includes(shape?.calendar ?? "") ? shape!.calendar : "unknown";
+  const clock = ["absent", "milliseconds", "seconds", "invalid"].includes(shape?.clock ?? "") ? shape!.clock : "unknown";
+  return ` reference_problem=${reason} reference_path_shape=${path} reference_calendar=${calendar} reference_clock=${clock}`;
+}
 
 /**
  * Explain the first rejected innermost reference field without relaxing admission.
@@ -45,14 +109,15 @@ export function pushRecordingReference(payload: Record<string, unknown>): PushRe
 }
 
 /**
- * Read the wall-calendar day from the observed HomeBase recording path layout.
+ * Read the wall-calendar day from the notification-owned HomeBase path layout.
  * Folder and filename timestamps must agree on the day and month. This is a
- * conservative route-specific layout, not a general filename/date heuristic.
+ * route-specific calendar layout, not a general filename/date heuristic. The
+ * single storage-directory component is opaque and cannot select a local file.
  * The later history join still requires the entire path and exact record ID.
  */
 export function recordingPathDate(path: unknown): string | null {
   if (typeof path !== "string" || path.length > 1024) return null;
-  const match = /^\/zx\/hdd_data[0-9]+\/Camera[0-9]{2}\/([0-9]{6})\/([0-9]{14})\/([0-9]{14})\.zxvideo$/.exec(path);
+  const match = /^\/zx\/[A-Za-z0-9_-]{1,64}\/Camera[0-9]{2}\/([0-9]{6})\/([0-9]{14})\/([0-9]{14})\.zxvideo$/.exec(path);
   if (!match || match[1] !== match[2]!.slice(0, 6) || match[2]!.slice(0, 8) !== match[3]!.slice(0, 8)) return null;
   for (const stamp of [match[2]!, match[3]!]) {
     const iso = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(8, 10)}:${stamp.slice(10, 12)}:${stamp.slice(12, 14)}Z`;

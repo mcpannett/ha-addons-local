@@ -25,6 +25,7 @@ import { refineE10OfferFailure } from "./e10-offer-diagnostic.js";
 import { e10IceServers, e10RouteLine, e10RouteSummary, type E10CandidateLike } from "./e10-route.js";
 import { VideoParameterSetCache } from "./live-stream-manager.js";
 import { markSourceTime } from "./media-source-clock.js";
+import { installE10RelayLifetime } from "./e10-relay-lifetime.js";
 import { installNvrIceTiming } from "./nvr-ice-timing.js";
 import { installNvrIceGathering } from "./nvr-ice-gathering.js";
 import { NvrPowerError, type NvrCameraPower } from "../provider/nvr-power-trial.js";
@@ -240,6 +241,15 @@ export interface NvrRtcStats {
   rejected: number;
   segmentNotEchoed: number;
   staleReplies: number;
+
+  /** Classifications observed only while the one live-start request is pending, without payload values. */
+  startReceiptWrongChannel: number;
+  startReceiptWrongSegment: number;
+  startReceiptOtherCommand: number;
+  startReceiptWrongInnerCommand: number;
+  startReceiptAcknowledged: number;
+  startReceiptRejected: number;
+  startReceiptMalformedJson: number;
   ignoredAudio: number;
 
   /** Checked AAC delivered for an admitted camera, and audio frames that failed the check. */
@@ -272,6 +282,31 @@ export interface NvrRtcStats {
 
   /** Signalling sockets retired after a normal viewer had valid video. */
   signallingClosuresAfterVideo: number;
+
+  /** Bound E10 signalling hangups received while a viewer-owned connected peer still supplies video. */
+  e10SignallingHangupsAfterVideo: number;
+
+  /** E10 keepalive envelopes accepted by the local WebSocket send queue, not delivery proof. */
+  signallingPingsQueued: number;
+
+  /** E10 action-2 messages observed after authentication, not a per-ping correlation. */
+  signallingPingResponses: number;
+
+  /** E10 keepalive queue attempts that threw before any delivery could be established. */
+  signallingPingQueueFailures: number;
+
+  /** E10 selected ICE route categories, or -1 before a pair is selected. No addresses are retained. */
+  e10LocalRelaySelected: number;
+  e10RemoteRelaySelected: number;
+
+  /** E10 selected-pair request and response counts, including consent requests in the request total. */
+  e10IceRequests: number;
+  e10IceResponses: number;
+  e10ConsentRequests: number;
+
+  /** Terminal transport failure categories, or -1 before that transport exists. */
+  e10IceFailed: number;
+  e10DtlsFailed: number;
 
   /** Signalling sockets retired after read-only discovery, while the RTC observer remains active. */
   signallingClosuresAfterModeObservation: number;
@@ -316,8 +351,8 @@ export class NvrRtcSession {
   #output = this.#createOutput();
   #audioOutput = this.#createOutput();
   readonly stats: NvrRtcStats = { packets: 0, frames: 0, video: 0, controlPackets: 0, rejected: 0,
-    segmentNotEchoed: 0, staleReplies: 0, ignoredAudio: 0, audio: 0, rejectedAudio: 0, ignoredUnknownMedia: 0,
-    applicationSequenceRecoveries: 0, videoSequenceRecoveries: 0, callsRepeated: 0, inventoryRepeated: 0, signallingClosuresAfterVideo: 0, signallingClosuresAfterModeObservation: 0, stopUnconfirmed: 0,
+    segmentNotEchoed: 0, staleReplies: 0, startReceiptWrongChannel: 0, startReceiptWrongSegment: 0, startReceiptOtherCommand: 0, startReceiptWrongInnerCommand: 0, startReceiptAcknowledged: 0, startReceiptRejected: 0, startReceiptMalformedJson: 0, ignoredAudio: 0, audio: 0, rejectedAudio: 0, ignoredUnknownMedia: 0,
+    applicationSequenceRecoveries: 0, videoSequenceRecoveries: 0, callsRepeated: 0, inventoryRepeated: 0, signallingClosuresAfterVideo: 0, e10SignallingHangupsAfterVideo: 0, signallingPingsQueued: 0, signallingPingResponses: 0, signallingPingQueueFailures: 0, e10LocalRelaySelected: -1, e10RemoteRelaySelected: -1, e10IceRequests: 0, e10IceResponses: 0, e10ConsentRequests: 0, e10IceFailed: -1, e10DtlsFailed: -1, signallingClosuresAfterModeObservation: 0, stopUnconfirmed: 0,
     reorderTimeoutChannel: -1, reorderTimeoutExpected: -1, reorderTimeoutWaiting: -1,
     reorderTimeoutAgeMs: 0, reorderTimeoutQueued: 0,
     channel0Frames: 0, channel1Frames: 0, channel2Frames: 0, channel3Frames: 0, channel4Frames: 0, channel5Frames: 0 };
@@ -389,6 +424,9 @@ export class NvrRtcSession {
 
   /** Video from the previous camera may still be arriving and is never delivered. */
   #switching = false;
+
+  /** Parked: connected with no camera started, waiting for a view to switch here. */
+  #parked = false;
 
   /** The NVR's camera list from this call's start. It cannot change during a call. */
   #inventory: Record<string, unknown> | null = null;
@@ -530,6 +568,53 @@ export class NvrRtcSession {
       && this.#channels.get("WebrtcDataChannel")?.readyState === "open";
   }
 
+  /** True while this call is parked and nothing is in flight, so a view can switch here. */
+  get idle(): boolean {
+    return this.#parked && !this.#retired && !this.#switching && !this.#pending && !this.#livePending
+      && this.#channels.get("WebrtcDataChannel")?.readyState === "open";
+  }
+
+  /**
+   * Stop this call's camera and keep the call connected with no camera, for a
+   * later switchCamera on the same NVR. A T8N00 ends the gateway's other calls
+   * when one of them hangs up, so the provider parks a call instead while other
+   * calls there are in use. The viewer's output ends here, and `owner` replaces
+   * the viewer's cancellation and currency checks until a view takes the call
+   * or it is closed.
+   */
+  async park(owner: Pick<NvrRtcOptions, "signal" | "current">): Promise<void> {
+    if (!this.switchable) throw new NvrTrialError("admission");
+    this.#switching = true;
+    if (!this.#timingsEmitted && this.#startInvoked) {
+      this.#timingsEmitted = true;
+      try { this.options.onTimings?.(this.timings); } catch { /* Diagnostics must never prevent parking. */ }
+    }
+    if (this.#modeObserved) {
+      this.#modeObserved = false;
+      try { this.options.onEffectiveMode?.(null); } catch { /* State listeners must not prevent parking. */ }
+    }
+    this.options.signal.removeEventListener("abort", this.#externalAbort);
+    this.options = { ...this.options, ...owner, ready: () => {}, liveControls: false, audio: false, onEffectiveMode: () => {}, onTimings: () => {} };
+    this.options.signal.addEventListener("abort", this.#externalAbort, { once: true });
+    const previous = this.#output, previousAudio = this.#audioOutput;
+    this.#output = this.#createOutput();
+    this.#audioOutput = this.#createOutput();
+    previous.end();
+    previousAudio.end();
+    for (const timer of [this.#firstFrame, this.#videoProgressTimer]) if (timer) clearTimeout(timer);
+    this.#firstFrame = null; this.#videoProgressTimer = null; this.#videoProgressExpiresAt = null;
+    this.#stage = "stop";
+    await this.#request(1004, 1500);
+    this.#guard();
+
+    // No camera is started now: later video is dropped, and the next switch sends no stop.
+    this.#startSent = false;
+    this.#resetVideo();
+    this.#parked = true;
+    this.#switching = false;
+    this.#stage = "state";
+  }
+
   /**
    * Move this call to another camera on the same NVR, without a new call.
    * The previous camera's output ends cleanly and ownership moves synchronously,
@@ -537,12 +622,14 @@ export class NvrRtcSession {
    * promise. The new output is reported only after a checked picture, which
    * leaves a failed switch free to close this call and open a fresh one.
    * Resolves with the milliseconds from the start request to that picture.
-   * An idle mode observer call becomes a normal view the same way.
+   * An idle mode observer call or a parked call becomes a normal view the same way.
    */
   async switchCamera(target: NvrSwitchTarget): Promise<number> {
     const observer = this.canTakeOver(this.options.station);
-    if (!observer && !this.switchable) throw new NvrTrialError("admission");
+    const parked = !observer && this.idle;
+    if (!observer && !parked && !this.switchable) throw new NvrTrialError("admission");
     this.#switching = true;
+    this.#parked = false;
     this.options.signal.removeEventListener("abort", this.#externalAbort);
 
     // The observer's own mode callback must not survive into the view.
@@ -556,8 +643,8 @@ export class NvrRtcSession {
     this.#resetVideo();
     this.#renewVideoProgress();
 
-    // An observer call never started a camera, so there is nothing to stop.
-    if (!observer) {
+    // An observer or parked call has no camera started, so there is nothing to stop.
+    if (!observer && !parked) {
       this.#stage = "stop";
       await this.#request(1004, 1500);
     }
@@ -937,6 +1024,7 @@ export class NvrRtcSession {
 
   /** Attempt stream stop and deterministically retire the original connection. */
   close(): Promise<void> {
+    this.#retainE10PeerEvidence();
     if (!this.#timingsEmitted && this.#startInvoked) {
       this.#timingsEmitted = true;
       try { this.options.onTimings?.(this.timings); } catch { /* Diagnostics must never prevent retirement. */ }
@@ -1137,14 +1225,27 @@ export class NvrRtcSession {
       this.#repeatCall();
       this.#signallingPing = setInterval(() => {
         if (!this.#retired && this.#socket?.readyState === WebSocket.OPEN) {
-          try { this.#send({ action: 2, data: JSON.stringify({ source: "WEB" }), code: 200 }, true); } catch { /* The socket's close event reports a lost socket. */ }
+
+          // General-camera pings use SMART even though call and hang-up use WEB.
+          const source = this.options.e10RtpTrial ? "SMART" : "WEB";
+          try {
+            this.#send({ action: 2, data: JSON.stringify({ source }), code: 200 }, true);
+            if (this.options.e10RtpTrial) this.stats.signallingPingsQueued++;
+          } catch {
+            if (this.options.e10RtpTrial) this.stats.signallingPingQueueFailures++;
+
+            // The socket's close event still owns failure handling.
+          }
         }
       }, SIGNALLING_PING_MILLISECONDS);
       return;
     }
 
     // The service's answer to the keep-alive ping.
-    if (inner.action === 2) return;
+    if (inner.action === 2) {
+      if (this.options.e10RtpTrial && this.#authenticated) this.stats.signallingPingResponses++;
+      return;
+    }
     if (!this.#authenticated || inner.action !== 3) throw new NvrTrialError("call", "call_unexpected_action");
     if (inner.sessionId !== this.options.context.sign) throw new NvrTrialError("negotiation", "session_mismatch");
     if (inner.sn !== this.options.station) throw new NvrTrialError("negotiation", "station_mismatch");
@@ -1152,6 +1253,18 @@ export class NvrRtcSession {
     if (this.options.e10RtpTrial && this.options.e10HangupEndsCall && inner.dataType === "hangup") {
       this.#e10Report(e10SignalSummary(inner, "e10_call_hangup", this.stats.video, this.stats.frames, false, this.#e10Extra()), false, "e10_call_hangup");
       throw new NvrTrialError("call", "e10_call_hangup");
+    }
+
+    // A connected E10 peer can continue media after the service ends signalling.
+    // Retain its owner and stall deadline, rather than losing the peer reference.
+    if (inner.dataType === "hangup") {
+      if (this.options.e10RtpTrial && this.#maximumLifetimeMilliseconds === null
+        && this.#bootstrapped && this.#startVideoObserved && this.#peer?.connectionState === "connected"
+        && this.remainingLifetimeMilliseconds > 0) {
+        this.stats.e10SignallingHangupsAfterVideo++;
+        return;
+      }
+      throw new NvrTrialError(this.#stage, "signalling_hangup");
     }
     let data: Record<string, unknown>;
     try { data = nvrJson(inner.data, this.options.e10RtpTrial ? "payload" : undefined); }
@@ -1207,7 +1320,7 @@ export class NvrRtcSession {
       try { peer = this.#peer = this.dependencies.peer(this.#e10Offer ? e10IceServers(this.#turn, this.options.e10NoRelay === true) : this.#turn, this.#e10Offer ?? undefined);
         observeRawPeer(peer, { station: this.options.station, camera: this.options.camera }); }
       catch { throw new NvrTrialError("negotiation", "peer_setup"); }
-      peer.connectionStateChange.subscribe(state => { if (state === "failed" || state === "disconnected") this.#fail("negotiation", state === "failed" ? "peer_failed" : "peer_disconnected"); });
+      peer.connectionStateChange.subscribe(state => { this.#retainE10PeerEvidence(); if (state === "failed" || state === "disconnected") this.#fail(this.#stage, state === "failed" ? "peer_failed" : "peer_disconnected"); });
       if (this.#e10Offer && this.options.onE10Route) {
         let reported = false;
         peer.connectionStateChange.subscribe(state => {
@@ -1243,6 +1356,7 @@ export class NvrRtcSession {
         }
       });
       await this.#step("remote_description", () => peer.setRemoteDescription(new RTCSessionDescription(offer.sdp, "offer"))); this.#guard();
+      if (this.#e10Offer) await this.#step("peer_setup", () => installE10RelayLifetime(peer, this.#negotiation.signal));
       this.#offerApplied = true;
       for (const candidate of this.#pendingCandidates.splice(0)) await this.#candidate(candidate);
       const answer = await this.#step("create_answer", () => peer.createAnswer()); this.#guard();
@@ -1250,6 +1364,22 @@ export class NvrRtcSession {
       widenNvrReceiveBuffers(peer);
       await this.#step("send_answer", () => { this.#action("info", { sdp: this.#e10Offer ? doorbellRtcAnswer(this.#e10Offer, peer.localDescription!.sdp) : peer.localDescription!.sdp }); this.#markTiming("answerSent"); this.#answerSent = true; this.#flushLocal(); });
     }
+  }
+
+  /** Copy only selected-route categories and counters before the peer is retired. */
+  #retainE10PeerEvidence(): void {
+    if (this.#retired || !this.options.e10RtpTrial || !this.#peer) return;
+    const ice = this.#peer.iceTransports[0]?.connection;
+    const dtls = this.#peer.dtlsTransports[0];
+    if (ice) this.stats.e10IceFailed = ice.state === "failed" ? 1 : 0;
+    if (dtls) this.stats.e10DtlsFailed = dtls.state === "failed" ? 1 : 0;
+    const pair = ice?.nominated;
+    if (!pair) return;
+    this.stats.e10LocalRelaySelected = pair.localCandidate.type === "relay" ? 1 : 0;
+    this.stats.e10RemoteRelaySelected = pair.remoteCandidate.type === "relay" ? 1 : 0;
+    this.stats.e10IceRequests = pair.requestsSent;
+    this.stats.e10IceResponses = pair.responsesReceived;
+    this.stats.e10ConsentRequests = pair.consentRequestsSent;
   }
 
   /** Receive only the selected H.264 track under this E10 call's existing owner. */
@@ -1285,6 +1415,9 @@ export class NvrRtcSession {
           }
           if (!this.output.write(output)) throw new NvrTrialError("video");
           this.#startVideoObserved = true;
+
+          // Only accepted picture output advances this RTP call beyond negotiation.
+          this.#stage = "video";
           this.#renewVideoProgress();
           this.#readyResolve?.(); this.#readyResolve = null; this.#readyReject = null;
         } catch (error) {
@@ -1592,26 +1725,49 @@ export class NvrRtcSession {
       return;
     }
     const pending = this.#pending;
-    if (!pending || frame.channel !== 255 || frame.segment !== pending.segment && (frame.segment !== 0 || pending.command === 1103 || pending.strict)) { this.stats.staleReplies++; return; }
+    if (!pending || frame.channel !== 255 || frame.segment !== pending.segment && (frame.segment !== 0 || pending.command === 1103 || pending.strict)) {
+      if (pending?.command === 1003) {
+        if (frame.channel !== 255) this.stats.startReceiptWrongChannel++;
+        else this.stats.startReceiptWrongSegment++;
+      }
+      this.stats.staleReplies++; return;
+    }
     if ((pending.strict || pending.command === 1103 || (this.#powerMode || this.#guardMode) && pending.command === 9100)
       && (frame.segment !== pending.segment || performance.now() >= pending.deadline)) { this.stats.staleReplies++; return; }
     if (frame.segment === 0) this.stats.segmentNotEchoed++;
     if (frame.command === 1350 && frame.payload.length >= 4
       && frame.payload.subarray(4).every((byte) => byte === 0)) {
-      if (frame.payload.readInt32LE(0) !== 0) { pending.reject(new NvrTrialError(this.#stage)); clearTimeout(pending.timer); this.#pending = null; }
-      else if (pending.command === 1003 || pending.command === 1004) { pending.resolve({}); clearTimeout(pending.timer); this.#pending = null; }
+      if (frame.payload.readInt32LE(0) !== 0) {
+        if (pending.command === 1003) this.stats.startReceiptRejected++;
+        pending.reject(new NvrTrialError(this.#stage)); clearTimeout(pending.timer); this.#pending = null;
+      } else if (pending.command === 1003 || pending.command === 1004) {
+        if (pending.command === 1003) this.stats.startReceiptAcknowledged++;
+        pending.resolve({}); clearTimeout(pending.timer); this.#pending = null;
+      }
       return;
     }
-    if (frame.command !== 1351) { this.stats.staleReplies++; return; }
+    if (frame.command !== 1351) {
+      if (pending.command === 1003) this.stats.startReceiptOtherCommand++;
+      this.stats.staleReplies++; return;
+    }
     let response: Record<string, unknown>;
     try { response = this.options.liveControls ? nvrLiveJson(frame.payload.toString("utf8")) : nvrJson(frame.payload.toString("utf8")); }
     catch (error) {
+      if (pending.command === 1003) this.stats.startReceiptMalformedJson++;
       if (!this.options.liveControls || pending.command !== 1103 && !pending.strict) throw error;
       clearTimeout(pending.timer); this.#pending = null; pending.reject(new NvrLiveControlError("unavailable", "reply")); return;
     }
-    if (response.cmd !== pending.command) { this.stats.staleReplies++; return; }
-    if (response.mIntRet !== undefined && response.mIntRet !== 0) pending.reject(new NvrTrialError(this.#stage));
-    else pending.resolve(response);
+    if (response.cmd !== pending.command) {
+      if (pending.command === 1003) this.stats.startReceiptWrongInnerCommand++;
+      this.stats.staleReplies++; return;
+    }
+    if (response.mIntRet !== undefined && response.mIntRet !== 0) {
+      if (pending.command === 1003) this.stats.startReceiptRejected++;
+      pending.reject(new NvrTrialError(this.#stage));
+    } else {
+      if (pending.command === 1003) this.stats.startReceiptAcknowledged++;
+      pending.resolve(response);
+    }
     clearTimeout(pending.timer); this.#pending = null;
   }
 

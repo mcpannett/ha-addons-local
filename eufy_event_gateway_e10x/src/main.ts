@@ -28,6 +28,7 @@ import {
   LiveStreamManager,
   spawnH265ViewerTranscoder,
   type ViewerClientSummary,
+  type ViewerSourceRequestSummary,
   type ViewerStartupSummary,
   type ViewerDeliverySummary,
   type ViewerTranscoderSummary,
@@ -94,7 +95,9 @@ if (config.provider === "simulated") {
     country: config.eufy.country,
     persistentDirectory: join(config.dataDirectory, "eufy-client"),
     maxStreamSeconds: config.maxStreamSeconds,
+    homeBaseLocalAddresses: config.homeBaseLocalAddresses ?? [],
     experimentalModelControls: config.experimentalModelControls,
+    experimentalHb2StartupRecovery: config.experimentalHb2StartupRecovery,
     experimentalE30Locks: config.experimentalE30Locks,
     experimentalNvrLive: config.experimentalNvrLive,
     experimentalT8420Live: config.experimentalT8420Live,
@@ -104,6 +107,7 @@ if (config.provider === "simulated") {
     apiAuthenticationConfigured: !!config.apiToken,
     experimentalDoorbellRtc: config.experimentalDoorbellRtc,
     experimentalGeneralRtc: config.experimentalGeneralRtc,
+    experimentalC31LiveTalkback: config.experimentalC31LiveTalkback === true,
     experimentalCloudRecordings: config.experimentalCloudRecordings,
     experimentalEventImageRequest: config.experimentalEventImageRequest,
     experimentalHomeBaseEventImages: config.experimentalHomeBaseEventImages,
@@ -130,7 +134,7 @@ const streams = new LiveStreamManager(
 );
 streams.on("native-transport-closed", (summary: NativeTransportSummary & { model: string }) => {
   const model = /^T[0-9A-Z]{3,15}$/.test(summary.model) ? summary.model : "unknown";
-  logger.info("camera_native_transport", `model=${model} codec=${summary.codec ?? "unknown"} audio=${summary.audio} start_wait_ms=${summary.startWaitMilliseconds ?? "none"} video_units=${summary.videoUnits} audio_batches=${summary.audioBatches} audio_resyncs=${summary.audioResyncs} audio_dropped=${summary.audioDropped}`);
+  logger.info("camera_native_transport", `model=${model} codec=${summary.codec ?? "unknown"} audio=${summary.audio} start_wait_ms=${summary.startWaitMilliseconds ?? "none"} video_units=${summary.videoUnits} audio_batches=${summary.audioBatches} audio_resyncs=${summary.audioResyncs} audio_dropped=${summary.audioDropped} first_audio_after_video_ms=${summary.firstAudioAfterVideoMilliseconds ?? "none"} audio_after_video_only=${summary.audioAfterVideoOnly}`);
 });
 streams.on("live-pacing-closed", (summary: LivePacingSummary) => {
   logger.info("camera_live_pacing", `model=T8171 buffer_ms=${summary.bufferMilliseconds} late_packets=${summary.latePackets} peak_queued_bytes=${summary.maximumQueuedBytes} video_packets=${summary.videoPackets} audio_packets=${summary.audioPackets} clock_rebases=${summary.clockRebases}`);
@@ -149,6 +153,9 @@ streams.on("warning", (error: unknown) => {
 });
 streams.on("shared-lens-closed", (detail: { model: string; reason: string }) => {
   logger.info("shared_lens_view_closed", `model=${detail.model} reason=${detail.reason}`);
+});
+streams.on("native-lens-closed", (detail: { model: string; lens: string; reason: string }) => {
+  logger.info("native_lens_view_closed", `model=${detail.model} lens=${detail.lens} reason=${detail.reason}`);
 });
 streams.on("viewer-transcoder-stopped", (detail: ViewerTranscoderSummary) => {
   const input = detail.inputCadence;
@@ -212,10 +219,17 @@ streams.on("viewer-delivery-stopped", (detail: ViewerDeliverySummary) => {
     ].join(" "),
   );
 });
+streams.on("viewer-source-request", (detail: ViewerSourceRequestSummary) => {
+  logger.info("camera_viewer_source_request", [
+    `camera_slot=${detail.cameraSlot} model=${detail.model} profile=${detail.profile} outcome=${detail.outcome}`,
+    `state=${detail.state} source_attached=${detail.sourceAttached} start_pending=${detail.startPending} stop_pending=${detail.stopPending}`,
+    `clients=${detail.clients} other_active_slots=${detail.otherActiveCameraSlots.join(",") || "none"}`,
+  ].join(" "));
+});
 streams.on("viewer-startup-timings", (detail: ViewerStartupSummary) => {
   logger.info("camera_viewer_start_timings", [
     `model=${detail.model} profile=${detail.profile} codec=${detail.sourceCodec ?? "unknown"}`,
-    `source_attempt=${detail.sourceAttempt} conversion_attempt=${detail.conversionAttempt} outcome=${detail.outcome}`,
+    `camera_slot=${detail.cameraSlot} source_attempt=${detail.sourceAttempt} conversion_attempt=${detail.conversionAttempt} outcome=${detail.outcome}`,
     `source_first_byte_ms=${detail.sourceFirstByteMilliseconds ?? "none"}`,
     `source_random_access_ms=${detail.sourceRandomAccessMilliseconds ?? "none"}`,
     `conversion_start_ms=${detail.conversionStartMilliseconds ?? "none"}`,
@@ -229,7 +243,7 @@ streams.on("viewer-client-stopped", (detail: ViewerClientSummary) => {
   logger.info(
     "viewer_client_stopped",
     [
-      `Viewer client stopped: model=${detail.model}`,
+      `Viewer client stopped: model=${detail.model} camera_slot=${detail.cameraSlot}`,
       `codec=${detail.sourceCodec ?? "unknown"}`,
       `profile=${detail.profile}`,
       `source_active=${detail.sourceActive}`,

@@ -14,13 +14,27 @@ import { dirname } from "node:path";
 
 import type { EventReceiverState } from "../domain/types.js";
 import { createLogger } from "../logging.js";
-import { pushRecordingReference, pushRecordingReferenceProblem, type PushRecordingReference, type PushRecordingReferenceProblem } from "./push-recording-reference.js";
+import { pushRecordingReference, pushRecordingReferenceProblem, pushRecordingReferenceShape, type PushRecordingReferenceShape, type PushRecordingReference, type PushRecordingReferenceProblem } from "./push-recording-reference.js";
 import { FcmRegistrar, FcmRequestError } from "./android-push/fcm.js";
 import { PushClient } from "./android-push/push-client.js";
 import type { FcmCredentials, RawPushMessage } from "./android-push/types.js";
 import type { MegaClient, PushRegistrationResult } from "./client.js";
 
 const logger = createLogger("push");
+
+/** Reduce transport failures to fixed support vocabulary without exposing arbitrary error data. */
+function transportFailureReason(error: unknown): "reset" | "timeout" | "refused" | "closed" | "tls_verification" | "decode" | "other" {
+  try {
+    const code = error !== null && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+    if (code === "ECONNRESET") return "reset";
+    if (code === "ETIMEDOUT") return "timeout";
+    if (code === "ECONNREFUSED") return "refused";
+    if (code === "EPIPE" || code === "ECONNABORTED") return "closed";
+    if (["ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "DEPTH_ZERO_SELF_SIGNED_CERT"].includes(code as string)) return "tls_verification";
+    if (code === "MCS_DECODE_FAILED") return "decode";
+  } catch {}
+  return "other";
+}
 
 /** Clock tolerance for a notification created at the current startup boundary. */
 const STARTUP_DELIVERY_TOLERANCE_MILLISECONDS = 5_000;
@@ -77,6 +91,9 @@ export interface MegaPushEvent {
 
   /** First rejected reference shape, never containing the rejected value. */
   readonly recordingReferenceProblem?: PushRecordingReferenceProblem;
+
+  /** Value-free layout and clock categories for a rejected innermost reference. */
+  readonly recordingReferenceShape?: PushRecordingReferenceShape;
   readonly fetchId: number | null;
   readonly senseId: string | null;
   readonly guardMode: number | null;
@@ -308,8 +325,8 @@ export class MegaPushReceiver {
       this.#publish("disconnected");
       logger.warn("push_socket_disconnected", "Android FCM receiver disconnected; transport will retry");
     });
-    receiver.on("error", () => {
-      if (this.#active(lifetime) && this.#receiver === receiver) logger.warn("push_socket_unavailable", "Android FCM receiver reported a transport error");
+    receiver.on("error", (error: unknown) => {
+      if (this.#active(lifetime) && this.#receiver === receiver) logger.warn("push_socket_unavailable", `Android FCM receiver reported a transport error reason=${transportFailureReason(error)}`);
     });
     receiver.on("message", (message: RawPushMessage) => {
       if (!this.#active(lifetime) || this.#receiver !== receiver) return;
@@ -510,7 +527,7 @@ export function parsePushEvent(data: unknown): MegaPushEvent | null {
     content: field("content"),
     pictureUrl: text(payload.pic_url),
     filePath: text(payload.file_path) ?? text(payload.p),
-    ...(recording ? { recording } : { recordingReferenceProblem: pushRecordingReferenceProblem(payload)! }),
+    ...(recording ? { recording } : { recordingReferenceProblem: pushRecordingReferenceProblem(payload)!, recordingReferenceShape: pushRecordingReferenceShape(payload) }),
     fetchId: integer(payload.fetch_id) ?? integer(payload.i),
     senseId: text(payload.sense_id) ?? text(payload.j),
     guardMode: integer(payload.station_guard_mode),

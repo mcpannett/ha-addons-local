@@ -75,16 +75,37 @@ export function mcsDeliveryLogSummary(object: unknown, duplicate: boolean): stri
     const key = (entry as Record<string, unknown>).key;
     return typeof key === "string" ? [key] : [];
   }));
+  const payloads = appData.filter((entry) => typeof entry === "object" && entry !== null
+    && (entry as Record<string, unknown>).key === "payload");
+  const payloadStatus = payloads.length === 0 ? "absent" : payloads.length > 1 ? "multiple"
+    : decodePayloadField((payloads[0] as Record<string, unknown>).value).status;
   return [
     `persistent_id_present=${typeof record.persistentId === "string"}`,
     `duplicate=${duplicate}`,
     `app_data_entries=${appData.length}`,
     `payload_entry=${keys.has("payload")}`,
+    `payload_status=${payloadStatus}`,
     `device_entry=${keys.has("device_sn")}`,
     `station_entry=${keys.has("station_sn")}`,
     `event_entry=${keys.has("a") || keys.has("event_type")}`,
     `category_present=${typeof record.category === "string"}`,
   ].join(" ");
+}
+
+/** Classify the existing body decoder's result without retaining a loggable value. */
+function decodePayloadField(value: unknown): { status: string; decoded?: unknown } {
+  if (typeof value !== "string") return { status: "invalid_value" };
+  if (value.length > 90_000) return { status: "encoded_limit" };
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return { status: "invalid_base64" };
+  const json = readNullTerminated(Buffer.from(value, "base64"));
+  if (Buffer.byteLength(json, "utf8") > 65_536) return { status: "decoded_limit" };
+  try {
+    const decoded: unknown = JSON.parse(json);
+    return { status: decoded !== null && typeof decoded === "object" && !Array.isArray(decoded)
+      ? "json_object" : "json_other", decoded };
+  } catch {
+    return { status: "invalid_json", decoded: json };
+  }
 }
 
 /** Decode bounded Firebase app-data fields while retaining the complete Eufy envelope. */
@@ -97,14 +118,8 @@ export function decodeMcsAppData(object: unknown): EufyPushMessage {
     const item = entry as Record<string, unknown>;
     if (typeof item.key !== "string" || item.key.length > 128 || typeof item.value !== "string") continue;
     if (item.key === "payload") {
-      if (item.value.length > 90_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(item.value)) continue;
-      const json = readNullTerminated(Buffer.from(item.value, "base64"));
-      if (Buffer.byteLength(json, "utf8") > 65_536) continue;
-      try {
-        data.payload = JSON.parse(json);
-      } catch {
-        data.payload = json;
-      }
+      const payload = decodePayloadField(item.value);
+      if ("decoded" in payload) data.payload = payload.decoded;
     } else if (item.value.length <= 2_048) {
       data[item.key] = item.value;
     }
@@ -168,6 +183,8 @@ export function normalizePushEvent(raw: RawPushMessage): PushEvent {
  * MegaPushReceiver owns this client and closes it on shutdown. This class owns
  * TLS reconnect, login, heartbeat, stanza decoding, and in-memory delivered
  * IDs; the caller persists the IDs and decides how camera events are routed.
+ * Socket-local stream acknowledgements precede duplicate filtering and retire
+ * with that connection. They establish receipt, never camera-event publication.
  */
 export class PushClient extends EventEmitter {
 
@@ -185,8 +202,17 @@ export class PushClient extends EventEmitter {
   private loggedIn = false;
   private closing = false;
 
+  /** Incoming stanza position on this socket, including its login response. */
+  private receivedStreamId = 0;
+
+  /** Reliable stanzas received since the last outgoing acknowledgement. */
+  private unacknowledgedMessages = 0;
+
   /** Consecutive MCS login rejections — transient ones self-heal via reconnect (see {@link onMessage}). */
   private loginFailures = 0;
+
+  /** Socket-local counts distinguish received bytes from decoded notification stanzas. */
+  private receiveProgress = { chunks: 0, bytes: 0, frames: 0, deliveries: 0, heartbeats: 0, decodeFailures: 0 };
 
   /**
    * Retain an Android identity for reconnects without changing its credentials.
@@ -224,6 +250,9 @@ export class PushClient extends EventEmitter {
     this.closing = false;
     this.parser.reset();
     this.loggedIn = false;
+    this.receivedStreamId = 0;
+    this.unacknowledgedMessages = 0;
+    this.receiveProgress = { chunks: 0, bytes: 0, frames: 0, deliveries: 0, heartbeats: 0, decodeFailures: 0 };
     const socket = this.transport.connect();
     this.rawConnection = observeRawSocket(socket, "android_push", "tls");
     this.socket = socket;
@@ -243,14 +272,17 @@ export class PushClient extends EventEmitter {
     });
     socket.on("data", (d: Buffer) => {
       if (this.socket !== socket) return;
+      this.receiveProgress.chunks++;
+      this.receiveProgress.bytes += d.length;
 
       // Any inbound bytes prove the connection is still alive.
       this.clearHeartbeatReplyTimer();
       try {
         this.parser.handleData(d);
       } catch {
+        this.receiveProgress.decodeFailures++;
         recordRaw({ boundary: "android_push_decode", connection: this.rawConnection, direction: "decode", metadata: { event: "parse_or_dispatch_failed" } });
-        this.emit("error", new Error("Android MCS frame could not be decoded"));
+        this.emit("error", Object.assign(new Error("Android MCS frame could not be decoded"), { code: "MCS_DECODE_FAILED" }));
         socket.destroy();
       }
     });
@@ -286,25 +318,38 @@ export class PushClient extends EventEmitter {
 
   private buildHeartbeatPing(): Buffer {
     const Ping = mcsRoot().lookupType("mcs_proto.HeartbeatPing");
-    const buf = Ping.encodeDelimited({}).finish();
+    const buf = Ping.encodeDelimited({ lastStreamIdReceived: this.receivedStreamId }).finish();
     return Buffer.concat([Buffer.from([MessageTag.HeartbeatPing]), buf]);
   }
 
-  private buildHeartbeatAck(lastStreamId?: number): Buffer {
+  private buildHeartbeatAck(): Buffer {
     const Ack = mcsRoot().lookupType("mcs_proto.HeartbeatAck");
-    const obj = lastStreamId ? { lastStreamIdReceived: lastStreamId } : {};
+    const obj = { lastStreamIdReceived: this.receivedStreamId };
     const buf = Ack.encodeDelimited(obj).finish();
     return Buffer.concat([Buffer.from([MessageTag.HeartbeatAck]), buf]);
   }
 
   private onMessage(m: McsMessage): void {
+    this.receiveProgress.frames++;
+    if (m.tag === MessageTag.DataMessageStanza) this.receiveProgress.deliveries++;
+    if (m.tag === MessageTag.HeartbeatPing || m.tag === MessageTag.HeartbeatAck) this.receiveProgress.heartbeats++;
     recordRaw({ boundary: "android_push_decode", connection: this.rawConnection, direction: "decode", metadata: { event: "frame_parsed", frame: m } });
+    if (this.loggedIn) {
+      this.receivedStreamId++;
+      if (typeof m.object?.persistentId === "string" && m.object.persistentId.length > 0) this.unacknowledgedMessages++;
+      if (this.unacknowledgedMessages >= 10
+        || m.tag === MessageTag.DataMessageStanza && m.object?.immediateAck === true) {
+        this.sendStreamAcknowledgement();
+      }
+    }
     switch (m.tag) {
       case MessageTag.LoginResponse:
         if (m.object?.error) {
           this.onLoginError(m.object.error);
         } else {
           this.loggedIn = true;
+          this.receivedStreamId = 1;
+          this.unacknowledgedMessages = 0;
           this.clearLoginTimer();
           this.currentDelay = 0;
           this.loginFailures = 0;
@@ -317,7 +362,10 @@ export class PushClient extends EventEmitter {
         this.handleDataMessage(m.object);
         break;
       case MessageTag.HeartbeatPing:
-        if (this.socket) this.socket.write(this.buildHeartbeatAck(m.object?.lastStreamIdReceived));
+        if (this.socket && this.loggedIn) {
+          this.socket.write(this.buildHeartbeatAck());
+          this.unacknowledgedMessages = 0;
+        }
         break;
       case MessageTag.HeartbeatAck:
         break;
@@ -326,6 +374,21 @@ export class PushClient extends EventEmitter {
         this.socket?.destroy();
         break;
     }
+  }
+
+  /**
+   * Acknowledge the incoming socket position before application deduplication.
+   * Google's stream-ack extension is an empty SET IQ with extension 13. The
+   * position counts received stanzas, never the peer's acknowledgement of our
+   * outgoing stream. Replayed deliveries still need transport acknowledgement.
+   */
+  private sendStreamAcknowledgement(): void {
+    if (!this.socket || !this.loggedIn) return;
+    const Iq = mcsRoot().lookupType("mcs_proto.IqStanza");
+    const body = Iq.encodeDelimited({ type: 1, id: "", extension: { id: 13, data: Buffer.alloc(0) },
+      lastStreamIdReceived: this.receivedStreamId }).finish();
+    this.socket.write(Buffer.concat([Buffer.from([MessageTag.IqStanza]), body]));
+    this.unacknowledgedMessages = 0;
   }
 
   /**
@@ -387,7 +450,9 @@ export class PushClient extends EventEmitter {
     this.heartbeatTimer = setInterval(() => {
       const socket = this.socket;
       if (!socket || !this.loggedIn) return;
+      this.logReceiveProgress("heartbeat");
       socket.write(this.buildHeartbeatPing());
+      this.unacknowledgedMessages = 0;
       if (this.heartbeatReplyTimer) return;
       this.heartbeatReplyTimer = setTimeout(() => {
         this.heartbeatReplyTimer = undefined;
@@ -414,12 +479,31 @@ export class PushClient extends EventEmitter {
   }
 
   private onClose(): void {
+    this.logReceiveProgress("closed");
     this.stopHeartbeat();
     this.clearLoginTimer();
     this.loggedIn = false;
     if (!this.closing) {
       this.emit("disconnect");
       this.scheduleReconnect();
+    }
+  }
+
+  /** Report only counts at existing lifecycle checkpoints, before deduplication or event parsing. */
+  private logReceiveProgress(checkpoint: "heartbeat" | "closed"): void {
+    const progress = this.receiveProgress;
+    try {
+      const framing = this.parser.diagnostic();
+      logger.info("mcs_receive_status", [
+        `checkpoint=${checkpoint}`, `chunks=${progress.chunks}`, `bytes=${progress.bytes}`,
+        `frames=${progress.frames}`, `data_stanzas=${progress.deliveries}`,
+        `heartbeat_frames=${progress.heartbeats}`, `decode_failures=${progress.decodeFailures}`,
+        `framing_state=${framing.state}`, `buffered_bytes=${framing.bufferedBytes}`,
+        `pending_body_bytes=${framing.pendingBodyBytes}`,
+      ].join(" "));
+    } catch {
+
+      // Support output must not interrupt heartbeat transmission or reconnect.
     }
   }
 

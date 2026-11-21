@@ -11,17 +11,19 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import type { ServerResponse } from "node:http";
 import { setPriority } from "node:os";
 import { type Readable, type Writable } from "node:stream";
 
 import type { DiagnosticMedia } from "../diagnostics/bundle-capture.js";
 
+import { safeCameraModel } from "../domain/safe-camera-model.js";
 import { GatewayState } from "../domain/gateway-state.js";
 import type { CameraState, GatewayEvent, SnapshotInfo, VideoCodec } from "../domain/types.js";
 import { SnapshotStore } from "../storage/snapshot-store.js";
 import { ViewerStartupTimeline, type ViewerStartupMilestones } from "./viewer-startup-timeline.js";
+import { spawnE340MainLensConverter } from "./e340-main-lens.js";
 import { SharedLensViews, spawnSharedLensConverter, type SharedLens, type SharedLensConverterFactory } from "./shared-lens-views.js";
+import { NativeLensView, type NvrLensCall } from "./native-lens-views.js";
 import { JpegParser } from "./jpeg-parser.js";
 import { qualifiedS340LiveSource } from "./live-frame-clock.js";
 import { MediaInputBound } from "./media-input-bound.js";
@@ -39,6 +41,12 @@ export interface StreamController {
 
   /** Resolve after the old source's stop callbacks and owned media I/O have retired. */
   stopStream(serial: string): Promise<void>;
+
+  /**
+   * Open one S4 lens on its own native NVR call for a pane camera. The provider
+   * admits it within the NVR's call budget, or rejects without opening a call.
+   */
+  openNvrLensCall?(serial: string, lens: SharedLens): Promise<NvrLensCall>;
 }
 
 /** Bounded timing counters for one side of a viewer conversion session. */
@@ -151,8 +159,31 @@ export type ViewerProfile = "compatible" | "native";
 export type ViewerCloseReason = "consumer_closed" | "consumer_error" | "start_failed" | "provider_stopped"
   | "source_ended" | "source_error" | "gateway_closed" | "codec_changed" | "conversion_failed" | "backpressure";
 
+/**
+ * Correlates a viewer request with one manager-owned camera session. Slots are
+ * allocated locally, are not derived from device identifiers, and are meaningful
+ * only within this manager and process run. The gateway log consumes the summary.
+ */
+export interface ViewerSourceRequestSummary {
+  readonly cameraSlot: number;
+  readonly model: string;
+  readonly profile: ViewerProfile;
+  readonly outcome: "requested" | "start_failed";
+  readonly state: "idle" | "starting" | "streaming" | "stopping" | "error";
+  readonly sourceAttached: boolean;
+  readonly startPending: boolean;
+  readonly stopPending: boolean;
+  readonly clients: number;
+
+  /** At most eight other currently attached sessions, with no persistent identity. */
+  readonly otherActiveCameraSlots: readonly number[];
+}
+
 /** Privacy-safe delivery evidence captured when one HTTP viewer disconnects. */
 export interface ViewerClientSummary {
+
+  /** Process-local session number shared with viewer-source-request diagnostics. */
+  readonly cameraSlot: number;
 
   /** First observed closure cause, preserved through later error and close events. */
   readonly closeReason: ViewerCloseReason;
@@ -177,6 +208,9 @@ export interface ViewerClientSummary {
 
 /** HTTP-write milestones for one viewer/source attempt. They do not prove HA rendering. */
 export interface ViewerStartupSummary extends ViewerStartupMilestones {
+
+  /** Process-local session number shared with viewer-source-request diagnostics. */
+  readonly cameraSlot: number;
   readonly model: string;
   readonly profile: ViewerProfile;
   readonly sourceCodec: VideoCodec | null;
@@ -213,6 +247,9 @@ interface PendingSourceStart {
 }
 
 interface Session {
+
+  /** Non-persistent ordinal owned by this manager, never a hash of a serial. */
+  readonly diagnosticSlot: number;
   readonly clients: Set<VideoViewerResponse>;
   readonly pendingClients: Set<VideoViewerResponse>;
   readonly clientDeliveries: Map<VideoViewerResponse, ViewerClientDelivery>;
@@ -229,6 +266,9 @@ interface Session {
   /** Activity-aware HA workers keep their call until HA actually closes the response. */
   readonly hlsClients: Set<VideoViewerResponse>;
   readonly audioConsumers: Set<(chunk: Buffer) => void>;
+
+  /** Marked native S220 views already retired for late AAC on this exact source. */
+  readonly lateAudioViews: Set<string>;
   parameterSets: VideoParameterSetCache;
   state: "idle" | "starting" | "streaming" | "stopping" | "error";
   start: PendingSourceStart | null;
@@ -606,6 +646,8 @@ function annexBStarts(data: Buffer): Array<{ offset: number; payloadOffset: numb
 export class LiveStreamManager extends EventEmitter {
   readonly #sessions = new Map<string, Session>();
   readonly #lensViews = new Map<string, SharedLensViews>();
+  readonly #mainLensViews = new Map<string, SharedLensViews>();
+  readonly #nativeLensViews = new Map<string, NativeLensView>();
   readonly #deliveredViews = new Set<string>();
   readonly #newViews = new Map<string, number>();
   readonly #heldViews = new Set<string>();
@@ -644,6 +686,28 @@ export class LiveStreamManager extends EventEmitter {
     return this.#addClient(serial, response, profile, performance.now(), view);
   }
 
+  /** Share a checked E340 main crop while preserving the existing source and recordings. */
+  async addMainLensClient(serial: string, response: VideoViewerResponse): Promise<void> {
+    if (this.#closed || response.destroyed || response.writableEnded) return;
+    const admitted = (): boolean => this.state.hasCamera(serial) && this.state.getCamera(serial).mainLensViewSupported === true;
+    if (!admitted()) throw new Error("Main lens view is unavailable");
+    let view = this.#mainLensViews.get(serial);
+    const fresh = !view;
+    if (!view) {
+      const owned = new SharedLensViews(() => new VideoParameterSetCache(), spawnE340MainLensConverter,
+        terminateMediaProcess, reason => {
+          if (this.#mainLensViews.get(serial) === owned) this.#mainLensViews.delete(serial);
+          this.emit("shared-lens-closed", { model: "T8214", reason });
+        }, admitted, 30_000, this.nowMilliseconds, ["fixed"]);
+      view = owned; this.#mainLensViews.set(serial, owned);
+    }
+    view.add("fixed", response);
+    if (fresh) {
+      try { await this.addClient(serial, view.input, "native"); }
+      catch (error) { view.close(); throw error; }
+    }
+  }
+
   /** Share both pane outputs through one unmarked native viewer, protecting its camera call. */
   async addLensClient(serial: string, lens: SharedLens, response: VideoViewerResponse): Promise<void> {
     if (this.#closed || response.destroyed || response.writableEnded) return;
@@ -670,11 +734,41 @@ export class LiveStreamManager extends EventEmitter {
     }
   }
 
+  /**
+   * Give a pane viewer its lens's own native call, shared by that pane's viewers.
+   * It never joins the camera's ordinary source and never transcodes. The two
+   * lenses are separate entries, so one closing leaves the other running.
+   */
+  async addNativeLensClient(serial: string, lens: SharedLens, response: VideoViewerResponse): Promise<void> {
+    if (this.#closed || response.destroyed || response.writableEnded) return;
+    const open = this.controller.openNvrLensCall?.bind(this.controller);
+    if (!open) throw new Error("Native lens views are unavailable");
+    const admitted = (): boolean => {
+      if (this.#closed || !this.state.hasCamera(serial)) return false;
+      const camera = this.state.getCamera(serial);
+      return camera.model === "T8E00" && camera.nvrLiveControlsSupported === true && camera.nvrSelectedView === 2;
+    };
+    if (!admitted()) throw new Error("Select the admitted NVR Both view before opening a lens");
+    const key = JSON.stringify([serial, lens]);
+    let view = this.#nativeLensViews.get(key);
+    if (!view || view.closed) {
+      const owned: NativeLensView = new NativeLensView(lens, () => open(serial, lens), new VideoParameterSetCache(),
+        this.stopGraceMilliseconds, admitted, reason => {
+          if (this.#nativeLensViews.get(key) === owned) this.#nativeLensViews.delete(key);
+          this.emit("native-lens-closed", { model: "T8E00", lens, reason });
+        });
+      view = owned; this.#nativeLensViews.set(key, owned);
+    }
+    try { await view.add(response); }
+    catch (error) { response.destroy(error instanceof Error ? error : undefined); }
+  }
+
   /** Keep the original request clock across retirement and transport setup. */
   async #addClient(serial: string, response: VideoViewerResponse, profile: ViewerProfile, requestedAtMilliseconds: number, view?: string): Promise<void> {
     if (response.destroyed || response.writableEnded) return;
     const session = this.#session(serial);
     const mayTakeCall = !!view && this.#viewMayTakeCall(view);
+    this.#emitSourceRequest(serial, session, profile, "requested");
     this.#assertShareable(session);
     if (session.stop) {
       if (!await this.#waitForStop(session, response)) return;
@@ -740,6 +834,7 @@ export class LiveStreamManager extends EventEmitter {
       await this.#ensureStarted(serial, session, mayTakeCall);
       if (view) this.#rememberDeliveredView(view);
     } catch (error) {
+      this.#emitSourceRequest(serial, session, profile, "start_failed");
       this.#markViewerClose(session, response, "start_failed");
       response.destroy(error instanceof Error ? error : undefined);
     }
@@ -777,7 +872,7 @@ export class LiveStreamManager extends EventEmitter {
    * from the old source out of a new viewer's startup buffer. The native profile
    * carries the camera's own video unconverted; compatible carries H.264.
    */
-  async addTransportClient(serial: string, response: ServerResponse, profile: ViewerProfile = "compatible", view?: string): Promise<void> {
+  async addTransportClient(serial: string, response: VideoViewerResponse, profile: ViewerProfile = "compatible", view?: string): Promise<void> {
     const requestedAtMilliseconds = performance.now();
     if (response.destroyed || response.writableEnded) return;
     const session = this.#session(serial);
@@ -791,7 +886,20 @@ export class LiveStreamManager extends EventEmitter {
     const stopped = (reason: string): void => { this.emit("warning", new Error(`Camera live transport stopped: reason=${reason}`)); };
     if (profile === "native") {
       const muxer = new NativeTransportMuxer(response, () => session.audioConsumers.delete(consumeNative), audioWait, stopped,
-        summary => this.emit("native-transport-closed", { model, ...summary }));
+        summary => this.emit("native-transport-closed", { model, ...summary }), undefined, () => {
+          if (this.#closed || !this.state.hasCamera(serial)) return false;
+          const camera = this.state.getCamera(serial);
+          if (camera.model !== "T8134" || camera.stationSerial !== serial || !view
+            || this.stopGraceMilliseconds < 10_000 || session.lateAudioViews.has(view)
+            || session.lateAudioViews.size >= 64 || !session.yieldingClients.has(muxer.videoInput)
+            || this.#heldViews.has(view) || session.heldClients.has(muxer.videoInput)
+            || session.recordings.size || session.leases || session.stop || !session.audioSource) return false;
+
+          // HA retries this marked response during the existing source grace.
+          // Reusing the mark permits one handover, never a reconnect loop.
+          session.lateAudioViews.add(view);
+          return true;
+        });
       const consumeNative = (chunk: Buffer): void => muxer.acceptAudio(chunk);
       session.audioConsumers.add(consumeNative);
       await this.#addClient(serial, muxer.videoInput, "native", requestedAtMilliseconds, view);
@@ -853,6 +961,46 @@ export class LiveStreamManager extends EventEmitter {
     } finally {
       session.leases -= 1;
       this.#scheduleStopIfUnused(serial, session);
+    }
+  }
+
+  /**
+   * Hold a decoded source until its end or the caller releases this lease.
+   * Source startup, normal viewer sharing and the existing maximum lifetime
+   * remain manager-owned. Cancellation releases only this operation's lease.
+   */
+  async holdManualLightSource(serial: string, signal: AbortSignal, ready: () => void): Promise<void> {
+    if (this.#closed || signal.aborted) throw new Error("Manual light source cancelled before startup");
+    const session = this.#session(serial);
+    this.#assertShareable(session);
+    const previousRevision = this.state.getCamera(serial).snapshot?.revision ?? 0;
+    this.#cancelStop(session);
+    session.leases++;
+    this.#updateState(serial, session);
+    const snapshot = this.#waitForSnapshot(serial, previousRevision, SNAPSHOT_CAPTURE_TIMEOUT_MILLISECONDS);
+    void snapshot.promise.catch(() => undefined);
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(new Error("Manual light source released"));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    let cleanup = (): void => {};
+    try {
+      await Promise.race([this.#ensureStarted(serial, session), cancelled]);
+      await Promise.race([snapshot.promise, cancelled]);
+      const source = session.source;
+      if (!source || source.destroyed || source.readableEnded || signal.aborted) throw new Error("Manual light source unavailable");
+      const ended = new Promise<void>(resolve => {
+        const finish = (): void => resolve();
+        source.once("end", finish); source.once("close", finish);
+        cleanup = () => { source.off("end", finish); source.off("close", finish); };
+      });
+      ready();
+      try { await Promise.race([ended, cancelled]); }
+      catch (error) { if (!signal.aborted) throw error; }
+    } finally {
+      cleanup(); snapshot.cancel(); signal.removeEventListener("abort", abort);
+      session.leases--; this.#scheduleStopIfUnused(serial, session);
     }
   }
 
@@ -1046,6 +1194,7 @@ export class LiveStreamManager extends EventEmitter {
     session.source = source;
     for (const delivery of session.clientDeliveries.values()) delivery.sourceAttached = true;
     session.audioSource = audio ?? null;
+    session.lateAudioViews.clear();
     audio?.on("data", (chunk: Buffer) => {
       if (session.generation !== generation || chunk.length === 0) return;
       if (!session.privateTrial && !session.suppressSnapshots && this.listenerCount("diagnostic-media")) {
@@ -1214,6 +1363,8 @@ export class LiveStreamManager extends EventEmitter {
   /** Stop every source and release FFmpeg processes during shutdown. */
   async close(): Promise<void> {
     for (const pair of this.#lensViews.values()) pair.close();
+    for (const view of this.#mainLensViews.values()) view.close();
+    for (const view of this.#nativeLensViews.values()) view.close("gateway_closed");
     if (this.#closed) return;
     this.#closed = true;
     this.emit("closed");
@@ -1788,6 +1939,7 @@ export class LiveStreamManager extends EventEmitter {
     delivery.startupReported = true;
     const milestones = session.viewerStartup.snapshot(delivery.requestedAtMilliseconds, converted);
     const summary: ViewerStartupSummary = {
+      cameraSlot: session.diagnosticSlot,
       ...milestones,
       model: session.model, profile: delivery.profile,
       sourceCodec: milestones.sourceFirstByteMilliseconds === null
@@ -1817,6 +1969,7 @@ export class LiveStreamManager extends EventEmitter {
     session.clientDeliveries.delete(response);
     const now = performance.now();
     const summary: ViewerClientSummary = {
+      cameraSlot: session.diagnosticSlot,
       closeReason: delivery.closeReason ?? "consumer_closed",
       sourceAttached: delivery.sourceAttached,
       profile: delivery.profile,
@@ -1841,6 +1994,25 @@ export class LiveStreamManager extends EventEmitter {
     this.emit("viewer-client-stopped", summary);
   }
 
+  /** Report ownership before admission and on provider failure without changing it. */
+  #emitSourceRequest(serial: string, session: Session, profile: ViewerProfile, outcome: ViewerSourceRequestSummary["outcome"]): void {
+    try {
+      const otherActiveCameraSlots: number[] = [];
+      for (const other of this.#sessions.values()) {
+        if (other !== session && other.source !== null && otherActiveCameraSlots.length < 8) otherActiveCameraSlots.push(other.diagnosticSlot);
+      }
+      const summary: ViewerSourceRequestSummary = {
+        cameraSlot: session.diagnosticSlot, model: safeCameraModel(this.state.getCamera(serial).model), profile, outcome,
+        state: session.state, sourceAttached: session.source !== null, startPending: session.start !== null,
+        stopPending: session.stop !== null, clients: session.clients.size, otherActiveCameraSlots,
+      };
+      this.emit("viewer-source-request", summary);
+    } catch {
+
+      // A diagnostic observer must not prevent a viewer from joining its source.
+    }
+  }
+
   #assertShareable(session: Session): void {
     if (session.privateTrial || session.suppressSnapshots && session.source !== null) throw new Error("Wait for the private video test to finish");
   }
@@ -1849,6 +2021,7 @@ export class LiveStreamManager extends EventEmitter {
     let session = this.#sessions.get(serial);
     if (!session) {
       session = {
+        diagnosticSlot: this.#sessions.size + 1,
         clients: new Set(),
         pendingClients: new Set(),
         clientDeliveries: new Map(),
@@ -1859,6 +2032,7 @@ export class LiveStreamManager extends EventEmitter {
         heldClients: new Map(),
         hlsClients: new Set(),
         audioConsumers: new Set(),
+        lateAudioViews: new Set(),
         parameterSets: new VideoParameterSetCache(),
         state: "idle",
         start: null,
